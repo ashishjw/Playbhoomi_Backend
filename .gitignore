@@ -1,0 +1,4 @@
+node_modules
+.env
+firebase/serviceAccountKey.json
+firebase_token/firebase_login.html
