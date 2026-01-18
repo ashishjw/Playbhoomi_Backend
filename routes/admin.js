@@ -5,6 +5,7 @@ const { db } = require("../firebase/firebase");
 const { checkAdminAuth } = require("../middleware/auth");
 const axios = require("axios");
 const { resolveShortUrl, extractLatLngFromUrl } = require("../utils/mapUtils");
+const cloudinary = require("../utils/cloudinary");
 router.post("/admin/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -39,6 +40,26 @@ router.post("/admin/login", async (req, res) => {
 
   res.json({ message: "Login successful", token });
 });
+
+// Image upload endpoint
+router.post("/admin/upload", checkAdminAuth, async (req, res) => {
+  try {
+    const { image } = req.body;
+    if (!image) {
+      return res.status(400).json({ error: "No image provided" });
+    }
+
+    const uploadResult = await cloudinary.uploader.upload(image, {
+      folder: "turf_images",
+    });
+
+    res.status(200).json(uploadResult);
+  } catch (error) {
+    console.error("Cloudinary upload error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 const generateRandomId = () => Math.floor(1000 + Math.random() * 9000);
 const generatePassword = () => Math.random().toString(36).slice(-8); // 8-char
@@ -243,9 +264,14 @@ router.post(
           .json({ message: "Missing required turf fields" });
       }
 
-      // ✅ Step 2: Fetch vendor details
+      // ✅ Step 2: Fetch vendor details with timeout
       const vendorRef = db.collection("vendors").doc(vendorId);
-      const vendorDoc = await vendorRef.get();
+      const vendorDoc = await Promise.race([
+        vendorRef.get(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Vendor fetch timeout")), 10000)
+        )
+      ]);
 
       if (!vendorDoc.exists) {
         return res.status(404).json({ message: "Vendor not found" });
@@ -266,12 +292,17 @@ router.post(
         courts: sport.courts || [],
       }));
 
-      // ✅ Step 4: Fetch amenities details
+      // ✅ Step 4: Fetch amenities details in batches with timeout
       let amenitiesData = [];
       if (amenities && amenities.length > 0) {
-        const amenitiesDocs = await Promise.all(
-          amenities.map((id) => db.collection("amenities_master").doc(id).get())
-        );
+        const amenitiesDocs = await Promise.race([
+          Promise.all(
+            amenities.map((id) => db.collection("amenities_master").doc(id).get())
+          ),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Amenities fetch timeout")), 10000)
+          )
+        ]);
 
         amenitiesData = amenitiesDocs
           .filter((doc) => doc.exists)
@@ -281,12 +312,17 @@ router.post(
           }));
       }
 
-      // ✅ Step 5: Fetch rules details
+      // ✅ Step 5: Fetch rules details with timeout
       let rulesData = [];
       if (rules && rules.length > 0) {
-        const rulesDocs = await Promise.all(
-          rules.map((id) => db.collection("rules_master").doc(id).get())
-        );
+        const rulesDocs = await Promise.race([
+          Promise.all(
+            rules.map((id) => db.collection("rules_master").doc(id).get())
+          ),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Rules fetch timeout")), 10000)
+          )
+        ]);
 
         rulesData = rulesDocs
           .filter((doc) => doc.exists)
@@ -304,19 +340,28 @@ router.post(
         sports: sportsData,
         amenities: amenitiesData,
         rules: rulesData,
-        images,
+        images: images || [],
         vendorId,
         vendorLocation,
         vendorGpsUrl,
         vendorCoordinates,
         createdAt: new Date().toISOString(),
-        cancellationHours,
-        featured,
+        cancellationHours: Number(cancellationHours) || 0,
+        featured: Number(featured) || 0,
         isSuspended: 0, // Active by default
       };
 
-      // ✅ Step 7: Save to Firestore
-      const turfRef = await vendorRef.collection("turfs").add(turfData);
+      console.log("✅ Prepared turf data, now saving to Firestore...");
+
+      // ✅ Step 7: Save to Firestore with timeout
+      const turfRef = await Promise.race([
+        vendorRef.collection("turfs").add(turfData),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Firestore write timeout after 30s")), 30000)
+        )
+      ]);
+
+      console.log("✅ Turf saved successfully with ID:", turfRef.id);
 
       // ✅ Step 8: Return response
       res.status(201).json({
@@ -327,7 +372,17 @@ router.post(
       });
     } catch (err) {
       console.error("❌ Error adding turf:", err);
-      res.status(500).json({ message: "Internal server error" });
+
+      // More specific error messages
+      if (err.message.includes("timeout")) {
+        return res.status(504).json({
+          message: "Request timeout - please try again with smaller images or check your connection"
+        });
+      }
+
+      res.status(500).json({
+        message: err.message || "Internal server error"
+      });
     }
   }
 );
@@ -731,10 +786,12 @@ router.get("/admin/turfs", checkAdminAuth, async (req, res) => {
           location: vendorData.location,
           description: turf.description,
           courtsCount: turf.courts?.length || 0,
+          courts: turf.courts || [],
           openTime,
           closeTime,
           createdAt: turf.createdAt,
           thumbnail: turf.images?.[0] || null,
+          isSuspended: turf.isSuspended || 0, // ✅ Include suspension status
         });
       });
     }
@@ -1059,7 +1116,7 @@ router.get("/admin/all-bookings", checkAdminAuth, async (req, res) => {
     const snapshot = await db.collection("bookings").get();
 
     if (snapshot.empty) {
-      return res.status(404).json({ message: "No bookings found" });
+      return res.status(200).json({ total: 0, bookings: [] });
     }
 
     const bookings = [];

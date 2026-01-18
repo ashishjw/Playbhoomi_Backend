@@ -1,11 +1,13 @@
 // generateToken.js
+require("dotenv").config();
 const { initializeApp } = require("firebase/app");
 const { getAuth, signInWithEmailAndPassword } = require("firebase/auth");
 
-// ✅ Paste your web config here from Firebase → Project Settings → General
+// ✅ Using Firebase config from environment variables
 const firebaseConfig = {
-  apiKey: "AIzaSyDH5ZEws-7_iIyuEWbMtCmJhiXvcVv5NwU",
-  authDomain: "venuebackend-e7230.firebaseapp.com",
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.FIREBASE_PROJECT_ID,
 };
 
 const app = initializeApp(firebaseConfig);

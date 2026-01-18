@@ -13,5 +13,12 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+
+// Configure Firestore settings to prevent timeout issues
+const settings = {
+  timestampsInSnapshots: true,
+  ignoreUndefinedProperties: true,
+};
+db.settings(settings);
 const auth = admin.auth();
 module.exports = { admin, db, auth };
