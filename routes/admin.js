@@ -387,6 +387,35 @@ router.post(
   }
 );
 
+// ✅ PUT /admin/vendors/:vendorId/status → Update vendor status
+router.put("/admin/vendors/:vendorId/status", checkAdminAuth, async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+    const { status } = req.body;
+
+    if (!status || !['Active', 'Inactive'].includes(status)) {
+      return res.status(400).json({ message: "Invalid status. Must be 'Active' or 'Inactive'" });
+    }
+
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const doc = await vendorRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ message: "Vendor not found" });
+    }
+
+    await vendorRef.update({ status, updatedAt: new Date().toISOString() });
+
+    res.status(200).json({
+      message: `Vendor marked as ${status}`,
+      vendor: { id: vendorId, status },
+    });
+  } catch (error) {
+    console.error("Error updating vendor status:", error);
+    res.status(500).json({ message: "Failed to update vendor status" });
+  }
+});
+
 router.delete("/admin/vendors/:vendorId", checkAdminAuth, async (req, res) => {
   try {
     const { vendorId } = req.params;
@@ -1300,6 +1329,82 @@ router.delete("/admin/rules/:id", checkAdminAuth, async (req, res) => {
     res.status(200).json({ message: "Rule deleted successfully" });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================================
+// NOTIFICATIONS MANAGEMENT
+// ========================================
+
+const {
+  sendAnnouncementToAllUsers,
+  sendNotificationToUser,
+} = require('../utils/notificationHelper');
+
+// ✅ POST /admin/notifications/send → Send notification to all users
+router.post("/admin/notifications/send", checkAdminAuth, async (req, res) => {
+  try {
+    const { title, message } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ message: "Title and message are required" });
+    }
+
+    const result = await sendAnnouncementToAllUsers(title, message);
+    
+    res.status(200).json({
+      message: "Notification sent successfully",
+      usersCount: result.count,
+    });
+  } catch (error) {
+    console.error("Error sending notification:", error);
+    res.status(500).json({ message: "Failed to send notification" });
+  }
+});
+
+// ✅ POST /admin/notifications/send-to-user → Send notification to specific user
+router.post("/admin/notifications/send-to-user", checkAdminAuth, async (req, res) => {
+  try {
+    const { userId, title, message } = req.body;
+
+    if (!userId || !title || !message) {
+      return res.status(400).json({ message: "userId, title, and message are required" });
+    }
+
+    // Verify user exists
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await sendNotificationToUser(userId, title, message);
+    
+    res.status(200).json({ message: "Notification sent successfully" });
+  } catch (error) {
+    console.error("Error sending notification to user:", error);
+    res.status(500).json({ message: "Failed to send notification" });
+  }
+});
+
+// ✅ GET /admin/notifications/history → Get notification history
+router.get("/admin/notifications/history", checkAdminAuth, async (req, res) => {
+  try {
+    const notificationsSnapshot = await db
+      .collection("notifications")
+      .where("type", "in", ["admin_announcement", "admin_message"])
+      .orderBy("createdAt", "desc")
+      .limit(100)
+      .get();
+
+    const notifications = notificationsSnapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    res.status(200).json({ notifications });
+  } catch (error) {
+    console.error("Error fetching notification history:", error);
+    res.status(500).json({ message: "Failed to fetch notification history" });
   }
 });
 

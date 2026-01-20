@@ -16,7 +16,7 @@ const generateToken = (uid) => {
 };
 
 // 🔄 Shared Function: Register or Login
-async function handleFirebaseUser(idToken, res) {
+async function handleFirebaseUser(idToken, res, additionalData = {}) {
   try {
     const decoded = await auth.verifyIdToken(idToken);
     const { uid, email, name, phone_number } = decoded;
@@ -28,8 +28,8 @@ async function handleFirebaseUser(idToken, res) {
       // Save to Firestore on first login
       await userRef.set({
         email,
-        name: name || "New User",
-        phone: phone_number || null,
+        name: name || additionalData.name || "New User",
+        phone: phone_number || additionalData.mobile || null,
         authType: decoded.firebase.sign_in_provider, // e.g., "google.com" or "password"
         createdAt: new Date().toISOString(),
       });
@@ -47,10 +47,10 @@ async function handleFirebaseUser(idToken, res) {
 
 // ✅ POST /users/register (Handled same as login)
 router.post("/users/register", async (req, res) => {
-  const { idToken } = req.body;
+  const { idToken, mobile, name } = req.body;
   if (!idToken) return res.status(400).json({ message: "idToken is required" });
 
-  return handleFirebaseUser(idToken, res);
+  return handleFirebaseUser(idToken, res, { mobile, name });
 });
 
 // ✅ POST /users/login
@@ -89,6 +89,136 @@ router.post("/users/guest", (req, res) => {
     guestId,
     expiresIn: "2h",
   });
+});
+
+// ✅ GET /users/profile → Get user profile
+router.get("/users/profile", checkUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const userData = userDoc.data();
+    res.status(200).json({ 
+      user: {
+        uid: userId,
+        email: userData.email,
+        name: userData.name,
+        phone: userData.phone,
+        photoURL: userData.photoURL,
+        authType: userData.authType,
+        createdAt: userData.createdAt,
+      }
+    });
+  } catch (error) {
+    console.error("Error fetching profile:", error);
+    res.status(500).json({ message: "Failed to fetch profile" });
+  }
+});
+
+// ✅ PUT /users/profile → Update user profile
+router.put("/users/profile", checkUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { name, phone, photoURL } = req.body;
+
+    const userRef = db.collection("users").doc(userId);
+    const updateData = {};
+
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (photoURL) updateData.photoURL = photoURL;
+
+    await userRef.update(updateData);
+
+    res.status(200).json({ 
+      message: "Profile updated successfully",
+      user: updateData 
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).json({ message: "Failed to update profile" });
+  }
+});
+
+// ✅ GET /users/notifications → Get user notifications
+router.get("/users/notifications", checkUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    
+    const notificationsSnapshot = await db
+      .collection("notifications")
+      .where("userId", "==", userId)
+      .orderBy("createdAt", "desc")
+      .limit(50)
+      .get();
+
+    const notifications = notificationsSnapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    res.status(200).json({ notifications });
+  } catch (error) {
+    console.error("Error fetching notifications:", error);
+    res.status(500).json({ message: "Failed to fetch notifications" });
+  }
+});
+
+// ✅ PUT /users/notifications/:id/read → Mark notification as read
+router.put("/users/notifications/:id/read", checkUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const notificationId = req.params.id;
+
+    const notificationRef = db.collection("notifications").doc(notificationId);
+    const notificationDoc = await notificationRef.get();
+
+    if (!notificationDoc.exists) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+
+    // Verify notification belongs to user
+    if (notificationDoc.data().userId !== userId) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    await notificationRef.update({ read: true });
+    res.status(200).json({ message: "Notification marked as read" });
+  } catch (error) {
+    console.error("Error marking notification as read:", error);
+    res.status(500).json({ message: "Failed to update notification" });
+  }
+});
+
+// ✅ DELETE /users/notifications/:id → Delete notification
+router.delete("/users/notifications/:id", checkUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const notificationId = req.params.id;
+
+    const notificationRef = db.collection("notifications").doc(notificationId);
+    const notificationDoc = await notificationRef.get();
+
+    if (!notificationDoc.exists) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+
+    // Verify notification belongs to user
+    if (notificationDoc.data().userId !== userId) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    await notificationRef.delete();
+    res.status(200).json({ message: "Notification deleted" });
+  } catch (error) {
+    console.error("Error deleting notification:", error);
+    res.status(500).json({ message: "Failed to delete notification" });
+  }
 });
 
 // 🌍 Haversine Formula (in km)
@@ -154,16 +284,27 @@ router.post("/users/nearby-venues", async (req, res) => {
 
       turfsSnapshot.forEach((turfDoc) => {
         const turfData = turfDoc.data();
+        console.log('🔎 [DEBUG] Turf data:', turfDoc.id, {
+          title: turfData.title,
+          hasCoordinates: !!turfData.coordinates,
+          hasVendorCoordinates: !!turfData.vendorCoordinates,
+          vendorCoordinates: turfData.vendorCoordinates,
+          allFields: Object.keys(turfData)
+        });
 
-        if (turfData.location) {
+        // Check for vendorCoordinates field (Admin Panel saves as vendorCoordinates)
+        if (turfData.vendorCoordinates) {
+          console.log('✅ [DEBUG] Turf has vendorCoordinates:', turfData.vendorCoordinates);
           const dist = getDistance(
             userLocation.latitude,
             userLocation.longitude,
-            turfData.location.latitude,
-            turfData.location.longitude
+            turfData.vendorCoordinates.lat,
+            turfData.vendorCoordinates.lng
           );
+          console.log('📏 [DEBUG] Distance:', dist, 'km');
 
-          if (dist <= 50) {
+          // Temporarily increased to 5000km for testing - change back to 50 later
+          if (dist <= 5000) {
             nearbyTurfs.push({
               turfId: turfDoc.id,
               title: turfData.title,
@@ -171,7 +312,7 @@ router.post("/users/nearby-venues", async (req, res) => {
               description: turfData.description,
               vendorName: vendorData.name,
               vendorPhone: vendorData.phone,
-              location: turfData.location,
+              location: { latitude: turfData.vendorCoordinates.lat, longitude: turfData.vendorCoordinates.lng },
               sports: turfData.sports,
               courts: turfData.courts,
               amenities: turfData.amenities,
@@ -181,7 +322,12 @@ router.post("/users/nearby-venues", async (req, res) => {
               createdAt: turfData.createdAt,
               distance: parseFloat(dist.toFixed(2)),
             });
+            console.log('✅ [DEBUG] Added turf to results');
+          } else {
+            console.log('❌ [DEBUG] Turf too far:', dist, 'km');
           }
+        } else {
+          console.log('❌ [DEBUG] Turf has no vendorCoordinates field');
         }
       });
     }
@@ -240,15 +386,16 @@ router.post("/users/search-turfs", async (req, res) => {
           Array.isArray(turf.sports) &&
           turf.sports.some((s) => s.name.toLowerCase().includes(lowerKeyword));
 
-        if ((matchesTitle || matchesSport) && turf.location) {
+        if ((matchesTitle || matchesSport) && turf.vendorCoordinates) {
           const dist = getDistanceFromLatLonInKm(
             latitude,
             longitude,
-            turf.location.latitude,
-            turf.location.longitude
+            turf.vendorCoordinates.lat,
+            turf.vendorCoordinates.lng
           );
 
-          if (dist <= 50) {
+          // Temporarily increased to 5000km for testing - change back to 50 later
+          if (dist <= 5000) {
             const minPrice = Math.min(...turf.sports.map((s) => s.slotPrice));
             const maxPrice = Math.max(...turf.sports.map((s) => s.slotPrice));
 
@@ -258,7 +405,7 @@ router.post("/users/search-turfs", async (req, res) => {
               address: turf.address,
               vendorName: vendorData.name,
               phone: vendorData.phone,
-              location: turf.location,
+              location: { latitude: turf.vendorCoordinates.lat, longitude: turf.vendorCoordinates.lng },
               sports: turf.sports,
               priceRange: { min: minPrice, max: maxPrice },
               amenities: turf.amenities,
