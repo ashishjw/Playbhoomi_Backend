@@ -7,6 +7,7 @@ const adminRoutes = require("./routes/admin");
 const vendorRoutes = require("./routes/vendors");
 const userRoutes = require("./routes/users");
 const uploadRoutes = require("./routes/upload");
+const slotLockingRoutes = require("./routes/slotLocking");
 
 const app = express();
 
@@ -18,6 +19,7 @@ app.use("/api", adminRoutes);
 app.use("/api", vendorRoutes);
 app.use("/api", userRoutes);
 app.use("/api", uploadRoutes);
+app.use("/api", slotLockingRoutes);
 
 app.get("/", (req, res) => {
     res.send("Backend is Running");

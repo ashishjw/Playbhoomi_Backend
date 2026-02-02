@@ -91,6 +91,34 @@ router.post("/users/guest", (req, res) => {
   });
 });
 
+// ✅ POST /users/refresh-token → Refresh JWT token using Firebase ID token
+router.post("/users/refresh-token", async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    
+    if (!idToken) {
+      return res.status(400).json({ message: "idToken is required" });
+    }
+
+    // Verify the Firebase ID token
+    const decoded = await auth.verifyIdToken(idToken);
+    const { uid } = decoded;
+
+    // Generate a new JWT token
+    const token = generateToken(uid);
+    
+    return res.status(200).json({ 
+      message: "Token refreshed successfully", 
+      token 
+    });
+  } catch (err) {
+    console.error("Token refresh error:", err);
+    return res.status(401).json({ 
+      message: "Invalid or expired Firebase token" 
+    });
+  }
+});
+
 // ✅ GET /users/profile → Get user profile
 router.get("/users/profile", checkUserAuth, async (req, res) => {
   try {
@@ -1021,7 +1049,7 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
 // });
 router.post("/bookings/summary", checkUserAuth, async (req, res) => {
   try {
-    const { vendorId, turfId, sports, selectedSlots } = req.body;
+    const { vendorId, turfId, sports, selectedSlots, date } = req.body;
 
     if (!vendorId || !turfId || !sports || !selectedSlots?.length) {
       return res
@@ -1054,19 +1082,20 @@ router.post("/bookings/summary", checkUserAuth, async (req, res) => {
         .json({ message: "Sport not available for this turf" });
     }
 
-    let pricePerSlot = selectedSportData.slotPrice;
+    let pricePerSlot = selectedSport.slotPrice;
 
     // If discounted
-    if (selectedSportData.discountedPrice > 0) {
-      pricePerSlot = selectedSportData.discountedPrice;
+    if (selectedSport.discountedPrice > 0) {
+      pricePerSlot = selectedSport.discountedPrice;
     }
 
     // If weekend
-    const day = new Date(date).getDay();
+    const bookingDate = date || new Date().toISOString();
+    const day = new Date(bookingDate).getDay();
     const isWeekend = day === 0 || day === 6;
 
-    if (isWeekend && selectedSportData.weekendPrice > 0) {
-      pricePerSlot = selectedSportData.weekendPrice;
+    if (isWeekend && selectedSport.weekendPrice > 0) {
+      pricePerSlot = selectedSport.weekendPrice;
     }
     const totalSlots = selectedSlots.length;
     const baseAmount = pricePerSlot * totalSlots;
@@ -1076,7 +1105,12 @@ router.post("/bookings/summary", checkUserAuth, async (req, res) => {
     const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
 
     const taxAmount = Math.round((baseAmount * taxRate) / 100);
-    const finalAmount = baseAmount + taxAmount;
+    const convenienceFee = 35; // Standard fee
+    const subtotal = baseAmount + taxAmount + convenienceFee;
+    
+    const discountRate = 10; // 10% Promotional discount
+    const discountAmount = Math.round((subtotal * discountRate) / 100);
+    const finalAmount = subtotal - discountAmount;
 
     res.status(200).json({
       turfId,
@@ -1089,8 +1123,11 @@ router.post("/bookings/summary", checkUserAuth, async (req, res) => {
       baseAmount,
       taxRate,
       taxAmount,
+      convenienceFee,
+      discountRate,
+      discountAmount,
       finalAmount,
-      message: "Booking summary with tax calculated",
+      message: "Booking summary with tax and fees calculated",
     });
   } catch (err) {
     console.error("Error generating summary:", err);

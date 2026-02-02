@@ -255,13 +255,13 @@ router.post(
         !address ||
         !description ||
         !sports ||
-        !amenities ||
-        !rules ||
-        !images
+        !Array.isArray(amenities) ||
+        !Array.isArray(rules) ||
+        !Array.isArray(images)
       ) {
         return res
           .status(400)
-          .json({ message: "Missing required turf fields" });
+          .json({ message: "Missing required turf fields or invalid array fields" });
       }
 
       // ✅ Step 2: Fetch vendor details with timeout
@@ -282,13 +282,17 @@ router.post(
       const vendorGpsUrl = vendorData.gpsUrl || "";
       const vendorCoordinates = vendorData.coordinates || null;
 
-      // ✅ Step 3: Process sports with timeSlots + courts
+      // ✅ Step 3: Process sports with timeSlots + courts + slotDuration + weekday/weekend slots
       const sportsData = (sports || []).map((sport) => ({
         name: sport.name,
         slotPrice: sport.slotPrice,
         discountedPrice: sport.discountedPrice ?? 0,
         weekendPrice: sport.weekendPrice ?? 0,
-        timeSlots: sport.timeSlots || sport.timings || [],
+        slotDuration: sport.slotDuration || 60, // Default to 60 minutes (1 hour)
+        weekdayTimeSlots: sport.weekdayTimeSlots || sport.timeSlots || sport.timings || [],
+        weekendTimeSlots: sport.weekendTimeSlots || sport.timeSlots || sport.timings || [],
+        // Keep timeSlots for backward compatibility (use weekday as default)
+        timeSlots: sport.weekdayTimeSlots || sport.timeSlots || sport.timings || [],
         courts: sport.courts || [],
       }));
 
@@ -1405,6 +1409,229 @@ router.get("/admin/notifications/history", checkAdminAuth, async (req, res) => {
   } catch (error) {
     console.error("Error fetching notification history:", error);
     res.status(500).json({ message: "Failed to fetch notification history" });
+  }
+});
+
+// ============================================
+// CONTENT MANAGEMENT ENDPOINTS
+// ============================================
+
+// GET /api/admin/content/help-support - Fetch Help & Support content for admin
+router.get("/admin/content/help-support", checkAdminAuth, async (req, res) => {
+  try {
+    const doc = await db.collection("app_content").doc("help_support").get();
+    
+    if (!doc.exists) {
+      // Return default content if not found
+      return res.status(200).json({
+        greeting: "Hi, How can we help you?",
+        contactOptions: [
+          {
+            id: 1,
+            title: "Email Us",
+            subtitle: "support@playbhoomi.com",
+            icon: "mail",
+            type: "email"
+          },
+          {
+            id: 2,
+            title: "Call Us",
+            subtitle: "+91 1234567890",
+            icon: "call",
+            type: "phone"
+          },
+          {
+            id: 3,
+            title: "WhatsApp",
+            subtitle: "Chat with us",
+            icon: "logo-whatsapp",
+            type: "whatsapp",
+            whatsappNumber: "+911234567890"
+          }
+        ],
+        faqs: [],
+        supportHours: "Monday - Sunday: 9:00 AM - 9:00 PM"
+      });
+    }
+
+    res.status(200).json(doc.data());
+  } catch (error) {
+    console.error("Error fetching help & support content:", error);
+    res.status(500).json({ message: "Failed to fetch content" });
+  }
+});
+
+// PUT /api/admin/content/help-support - Update Help & Support content
+router.put("/admin/content/help-support", checkAdminAuth, async (req, res) => {
+  try {
+    const { greeting, contactOptions, faqs, supportHours } = req.body;
+
+    if (!greeting || !contactOptions || !faqs || !supportHours) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    const contentData = {
+      greeting,
+      contactOptions,
+      faqs,
+      supportHours,
+      updatedAt: new Date().toISOString()
+    };
+
+    await db.collection("app_content").doc("help_support").set(contentData, { merge: true });
+
+    res.status(200).json({ 
+      message: "Help & Support content updated successfully",
+      content: contentData
+    });
+  } catch (error) {
+    console.error("Error updating help & support content:", error);
+    res.status(500).json({ message: "Failed to update content" });
+  }
+});
+
+// GET /api/admin/content/terms-conditions - Fetch Terms & Conditions for admin
+router.get("/admin/content/terms-conditions", checkAdminAuth, async (req, res) => {
+  try {
+    const doc = await db.collection("app_content").doc("terms_conditions").get();
+    
+    if (!doc.exists) {
+      // Return default content if not found
+      return res.status(200).json({
+        title: "Terms & Conditions",
+        lastUpdated: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+        sections: [
+          {
+            id: 1,
+            title: "1. Acceptance of Terms",
+            content: "By accessing and using this turf booking application, you accept and agree to be bound by the terms and provision of this agreement."
+          }
+        ],
+        contactEmail: "support@playbhoomi.com"
+      });
+    }
+
+    res.status(200).json(doc.data());
+  } catch (error) {
+    console.error("Error fetching terms & conditions:", error);
+    res.status(500).json({ message: "Failed to fetch content" });
+  }
+});
+
+// PUT /api/admin/content/terms-conditions - Update Terms & Conditions
+router.put("/admin/content/terms-conditions", checkAdminAuth, async (req, res) => {
+  try {
+    const { title, lastUpdated, sections, contactEmail } = req.body;
+
+    if (!title || !sections || !contactEmail) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    const contentData = {
+      title,
+      lastUpdated,
+      sections,
+      contactEmail,
+      updatedAt: new Date().toISOString()
+    };
+
+    await db.collection("app_content").doc("terms_conditions").set(contentData, { merge: true });
+
+    res.status(200).json({ 
+      message: "Terms & Conditions updated successfully",
+      content: contentData
+    });
+  } catch (error) {
+    console.error("Error updating terms & conditions:", error);
+    res.status(500).json({ message: "Failed to update content" });
+  }
+});
+
+// ============================================
+// PUBLIC CONTENT ENDPOINTS (No Auth Required)
+// ============================================
+
+// GET /api/content/help-support - Public endpoint for user app
+router.get("/content/help-support", async (req, res) => {
+  try {
+    const doc = await db.collection("app_content").doc("help_support").get();
+    
+    if (!doc.exists) {
+      // Return default content
+      return res.status(200).json({
+        greeting: "Hi, How can we help you?",
+        contactOptions: [
+          {
+            id: 1,
+            title: "Email Us",
+            subtitle: "support@playbhoomi.com",
+            icon: "mail",
+            type: "email"
+          },
+          {
+            id: 2,
+            title: "Call Us",
+            subtitle: "+91 1234567890",
+            icon: "call",
+            type: "phone"
+          },
+          {
+            id: 3,
+            title: "WhatsApp",
+            subtitle: "Chat with us",
+            icon: "logo-whatsapp",
+            type: "whatsapp",
+            whatsappNumber: "+911234567890"
+          }
+        ],
+        faqs: [
+          {
+            id: 1,
+            question: "How do I book a turf?",
+            answer: "Browse available turfs on the home screen, select your preferred turf, choose date and time slots, and proceed to payment to confirm your booking."
+          }
+        ],
+        supportHours: "Monday - Sunday: 9:00 AM - 9:00 PM"
+      });
+    }
+
+    res.status(200).json(doc.data());
+  } catch (error) {
+    console.error("Error fetching help & support content:", error);
+    res.status(500).json({ message: "Failed to fetch content" });
+  }
+});
+
+// GET /api/content/terms-conditions - Public endpoint for user app
+router.get("/content/terms-conditions", async (req, res) => {
+  try {
+    const doc = await db.collection("app_content").doc("terms_conditions").get();
+    
+    if (!doc.exists) {
+      // Return default content
+      return res.status(200).json({
+        title: "Terms & Conditions",
+        lastUpdated: "January 19, 2026",
+        sections: [
+          {
+            id: 1,
+            title: "1. Acceptance of Terms",
+            content: "By accessing and using this turf booking application, you accept and agree to be bound by the terms and provision of this agreement."
+          },
+          {
+            id: 2,
+            title: "2. Booking Policy",
+            content: "• All bookings are subject to availability\n• Booking confirmation will be sent via email/SMS\n• Payment must be completed to confirm booking\n• Booking slots are for the specified time duration only"
+          }
+        ],
+        contactEmail: "support@playbhoomi.com"
+      });
+    }
+
+    res.status(200).json(doc.data());
+  } catch (error) {
+    console.error("Error fetching terms & conditions:", error);
+    res.status(500).json({ message: "Failed to fetch content" });
   }
 });
 
