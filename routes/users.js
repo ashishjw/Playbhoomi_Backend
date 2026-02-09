@@ -26,13 +26,25 @@ async function handleFirebaseUser(idToken, res, additionalData = {}) {
 
     if (!userDoc.exists) {
       // Save to Firestore on first login
-      await userRef.set({
-        email,
-        name: name || additionalData.name || "New User",
-        phone: phone_number || additionalData.mobile || null,
-        authType: decoded.firebase.sign_in_provider, // e.g., "google.com" or "password"
+      const userData = {
+        authType: decoded.firebase.sign_in_provider, // e.g., "google.com", "password", or "phone"
         createdAt: new Date().toISOString(),
-      });
+      };
+
+      // Handle phone authentication
+      if (decoded.firebase.sign_in_provider === 'phone') {
+        userData.phone = phone_number || additionalData.mobile || null;
+        userData.name = additionalData.name || 'User';
+        // Email might not exist for phone users
+        if (email) userData.email = email;
+      } else {
+        // Handle email/google authentication
+        userData.email = email;
+        userData.name = name || additionalData.name || "New User";
+        userData.phone = phone_number || additionalData.mobile || null;
+      }
+
+      await userRef.set(userData);
     }
 
     const token = generateToken(uid);
