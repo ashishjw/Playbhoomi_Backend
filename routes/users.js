@@ -1,12 +1,23 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
-const { auth, db } = require("../firebase/firebase");
+const crypto = require("crypto");
+const Razorpay = require("razorpay");
+const { auth, db, admin } = require("../firebase/firebase");
 const { v4: uuidv4 } = require("uuid");
 const haversine = require("haversine-distance");
 const checkUserAuth = require("../middleware/checkUserAuth");
+const { rejectGuest } = require("../middleware/checkUserAuth");
 const PDFDocument = require("pdfkit");
 const stream = require("stream-buffers");
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || "",
+  key_secret: process.env.RAZORPAY_KEY_SECRET || "",
+});
+
+const isRazorpayConfigured = () =>
+  !!process.env.RAZORPAY_KEY_ID && !!process.env.RAZORPAY_KEY_SECRET;
 
 // JWT Generator (Your Own Token)
 const generateToken = (uid) => {
@@ -73,6 +84,14 @@ router.post("/users/login", async (req, res) => {
   return handleFirebaseUser(idToken, res);
 });
 
+// ✅ POST /users/refresh-token — reissue JWT from a valid Firebase idToken
+router.post("/users/refresh-token", async (req, res) => {
+  const { idToken } = req.body;
+  if (!idToken) return res.status(400).json({ message: "idToken is required" });
+
+  return handleFirebaseUser(idToken, res);
+});
+
 // ✅ POST /users/google (Same logic)
 router.post("/users/google", async (req, res) => {
   const { idToken } = req.body;
@@ -102,6 +121,84 @@ router.post("/users/guest", (req, res) => {
     expiresIn: "2h",
   });
 });
+
+const computeBookingSummary = async ({
+  vendorId,
+  turfId,
+  sports,
+  selectedSlots,
+  date,
+}) => {
+  const turfRef = db
+    .collection("vendors")
+    .doc(vendorId)
+    .collection("turfs")
+    .doc(turfId);
+  const turfSnap = await turfRef.get();
+
+  if (!turfSnap.exists) {
+    const err = new Error("Turf not found");
+    err.status = 404;
+    throw err;
+  }
+
+  const turfData = turfSnap.data();
+  const normalizedSport = sports.trim().toLowerCase();
+
+  const selectedSportData = (turfData.sports || []).find(
+    (s) => s.name.toLowerCase() === normalizedSport
+  );
+
+  if (!selectedSportData) {
+    const err = new Error("Sport not available for this turf");
+    err.status = 400;
+    throw err;
+  }
+
+  let pricePerSlot = selectedSportData.slotPrice || 0;
+  if ((selectedSportData.discountedPrice || 0) > 0) {
+    pricePerSlot = selectedSportData.discountedPrice;
+  }
+
+  const bookingDate = date || new Date().toISOString();
+  const day = new Date(bookingDate).getDay();
+  const isWeekend = day === 0 || day === 6;
+
+  if (isWeekend && (selectedSportData.weekendPrice || 0) > 0) {
+    pricePerSlot = selectedSportData.weekendPrice;
+  }
+
+  const totalSlots = selectedSlots.length;
+  const baseAmount = pricePerSlot * totalSlots;
+
+  const taxSnap = await db.collection("tax").doc("global").get();
+  const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
+  const taxAmount = Math.round((baseAmount * taxRate) / 100);
+  const convenienceFee = 35;
+  const subtotal = baseAmount + taxAmount + convenienceFee;
+  const discountRate = 10;
+  const discountAmount = Math.round((subtotal * discountRate) / 100);
+  const finalAmount = subtotal - discountAmount;
+
+  return {
+    vendorId,
+    turfId,
+    turfTitle: turfData.title,
+    location: turfData.address,
+    selectedSport: normalizedSport,
+    selectedSlots,
+    date,
+    pricePerSlot,
+    totalSlots,
+    baseAmount,
+    taxRate,
+    taxAmount,
+    convenienceFee,
+    discountRate,
+    discountAmount,
+    finalAmount,
+  };
+};
 
 // ✅ POST /users/refresh-token → Refresh JWT token using Firebase ID token
 router.post("/users/refresh-token", async (req, res) => {
@@ -510,13 +607,13 @@ router.post("/users/filter-turfs", async (req, res) => {
       turfsSnapshot.forEach((turfDoc) => {
         const turf = turfDoc.data();
 
-        if (!turf.location) return;
+        if (!turf.vendorCoordinates) return;
 
         const dist = getDistanceFromLatLonInKm(
           latitude,
           longitude,
-          turf.location.latitude,
-          turf.location.longitude
+          turf.vendorCoordinates.lat,
+          turf.vendorCoordinates.lng
         );
 
         if (dist > maxDistanceKm) return;
@@ -950,14 +1047,20 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
     }
 
     // =====================================================
-    // 3️⃣ FETCH SLOT STATUS FOR THIS DATE
+    // 3️⃣ CHECK BOOKINGS COLLECTION (canonical source of truth)
     // =====================================================
-    const slotStatusRef = turfRef.collection("slotStatus").doc(date);
-    const slotStatusDoc = await slotStatusRef.get();
+    const bookingSnapshot = await db
+      .collection("bookings")
+      .where("vendorId", "==", vendorId)
+      .where("turfId", "==", turfId)
+      .where("sports", "==", sportName)
+      .where("date", "==", date)
+      .where("timeSlot", "==", slot)
+      .where("bookingStatus", "==", "confirmed")
+      .limit(1)
+      .get();
 
-    const slotData = slotStatusDoc.exists ? slotStatusDoc.data() : {};
-
-    const isBooked = slotData?.[sportName]?.[slot]?.booked === true;
+    const isBooked = !bookingSnapshot.empty;
 
     // =====================================================
     // 4️⃣ IF NOT BOOKED → AVAILABLE
@@ -972,19 +1075,32 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
     // =====================================================
     // 5️⃣ SLOT IS BOOKED → SUGGEST NEARBY SLOTS
     // =====================================================
+    // Fetch all booked slots for this date/sport to check neighbors
+    const allBookingsSnapshot = await db
+      .collection("bookings")
+      .where("vendorId", "==", vendorId)
+      .where("turfId", "==", turfId)
+      .where("sports", "==", sportName)
+      .where("date", "==", date)
+      .where("bookingStatus", "==", "confirmed")
+      .get();
+
+    const bookedSlots = new Set();
+    allBookingsSnapshot.forEach((doc) => bookedSlots.add(doc.data().timeSlot));
+
     const index = allSlots.indexOf(slot);
     const suggestions = [];
 
     // previous slot
     if (index > 0) {
       const prev = allSlots[index - 1];
-      if (!slotData?.[sportName]?.[prev]?.booked) suggestions.push(prev);
+      if (!bookedSlots.has(prev)) suggestions.push(prev);
     }
 
     // next slot
     if (index < allSlots.length - 1) {
       const next = allSlots[index + 1];
-      if (!slotData?.[sportName]?.[next]?.booked) suggestions.push(next);
+      if (!bookedSlots.has(next)) suggestions.push(next);
     }
 
     return res.status(200).json({
@@ -1069,81 +1185,22 @@ router.post("/bookings/summary", checkUserAuth, async (req, res) => {
         .json({ message: "Missing required booking fields" });
     }
 
-    // Get turf data
-    const turfRef = db
-      .collection("vendors")
-      .doc(vendorId)
-      .collection("turfs")
-      .doc(turfId);
-    const turfSnap = await turfRef.get();
-
-    if (!turfSnap.exists) {
-      return res.status(404).json({ message: "Turf not found" });
-    }
-
-    const turfData = turfSnap.data();
-
-    // Get sport slot price
-    const selectedSport = turfData.sports.find(
-      (s) => s.name.toLowerCase() === sports.toLowerCase()
-    );
-
-    if (!selectedSport) {
-      return res
-        .status(400)
-        .json({ message: "Sport not available for this turf" });
-    }
-
-    let pricePerSlot = selectedSport.slotPrice;
-
-    // If discounted
-    if (selectedSport.discountedPrice > 0) {
-      pricePerSlot = selectedSport.discountedPrice;
-    }
-
-    // If weekend
-    const bookingDate = date || new Date().toISOString();
-    const day = new Date(bookingDate).getDay();
-    const isWeekend = day === 0 || day === 6;
-
-    if (isWeekend && selectedSport.weekendPrice > 0) {
-      pricePerSlot = selectedSport.weekendPrice;
-    }
-    const totalSlots = selectedSlots.length;
-    const baseAmount = pricePerSlot * totalSlots;
-
-    // Fetch current tax percentage
-    const taxSnap = await db.collection("tax").doc("global").get();
-    const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
-
-    const taxAmount = Math.round((baseAmount * taxRate) / 100);
-    const convenienceFee = 35; // Standard fee
-    const subtotal = baseAmount + taxAmount + convenienceFee;
-    
-    const discountRate = 10; // 10% Promotional discount
-    const discountAmount = Math.round((subtotal * discountRate) / 100);
-    const finalAmount = subtotal - discountAmount;
+    const summary = await computeBookingSummary({
+      vendorId,
+      turfId,
+      sports,
+      selectedSlots,
+      date,
+    });
 
     res.status(200).json({
-      turfId,
-      turfTitle: turfData.title,
-      location: turfData.address,
-      selectedSport: sports,
-      selectedSlots,
-      pricePerSlot,
-      totalSlots,
-      baseAmount,
-      taxRate,
-      taxAmount,
-      convenienceFee,
-      discountRate,
-      discountAmount,
-      finalAmount,
+      ...summary,
       message: "Booking summary with tax and fees calculated",
     });
   } catch (err) {
     console.error("Error generating summary:", err);
-    res.status(500).json({ message: "Internal server error" });
+    const status = err.status || 500;
+    res.status(status).json({ message: err.message || "Internal server error" });
   }
 });
 
@@ -1208,32 +1265,79 @@ router.get("/bookings/summary", checkUserAuth, async (req, res) => {
   }
 });
 
-router.post("/bookings/create-order", checkUserAuth, async (req, res) => {
+router.post("/bookings/create-order", checkUserAuth, rejectGuest, async (req, res) => {
   try {
-    const { amount, currency = "INR", turfId } = req.body;
+    const { currency = "INR", bookingDetails } = req.body;
     const userId = req.user.uid;
 
-    if (!amount || !turfId) {
-      return res.status(400).json({ message: "Amount and turfId required" });
+    if (!bookingDetails) {
+      return res.status(400).json({ message: "bookingDetails is required" });
     }
 
-    // ✅ Auto-generate receipt ID
-    const receipt = `${turfId}_${userId}_${Date.now()}`;
+    const { vendorId, turfId, sports, selectedSlots, date } = bookingDetails;
+    if (
+      !vendorId ||
+      !turfId ||
+      !sports ||
+      !Array.isArray(selectedSlots) ||
+      selectedSlots.length === 0 ||
+      !date
+    ) {
+      return res.status(400).json({
+        message:
+          "bookingDetails must include vendorId, turfId, sports, selectedSlots, and date",
+      });
+    }
+
+    if (process.env.RAZORPAY_TEST_MODE !== "true" && !isRazorpayConfigured()) {
+      return res.status(500).json({
+        message: "Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET",
+      });
+    }
+
+    const summary = await computeBookingSummary({
+      vendorId,
+      turfId,
+      sports,
+      selectedSlots,
+      date,
+    });
+    const finalAmount = summary.finalAmount;
+    const amountInPaise = Math.round(Number(finalAmount) * 100);
+    if (!Number.isFinite(amountInPaise) || amountInPaise <= 0) {
+      return res.status(400).json({ message: "Invalid computed amount" });
+    }
+
+    // Deterministic receipt for idempotency — same booking details produce same receipt
+    const normalizedSlotsForReceipt = selectedSlots.map((s) => s.trim()).sort().join(",");
+    const receiptData = `${turfId}_${userId}_${date}_${sports.trim().toLowerCase()}_${normalizedSlotsForReceipt}`;
+    const receipt = crypto.createHash("md5").update(receiptData).digest("hex").slice(0, 40);
 
     if (process.env.RAZORPAY_TEST_MODE === "true") {
       return res.status(201).json({
         message: "Mock order created",
         orderId: "order_test_12345",
-        amount: amount * 100,
+        amount: amountInPaise,
         currency,
         receipt,
+        finalAmount,
       });
     }
 
     const order = await razorpay.orders.create({
-      amount: amount * 100,
+      amount: amountInPaise,
       currency,
       receipt,
+      notes: {
+        userId,
+        vendorId,
+        turfId,
+        sports: sports.trim().toLowerCase(),
+        date,
+        slotCount: String(selectedSlots.length),
+        finalAmount: String(finalAmount),
+        amountInPaise: String(amountInPaise),
+      },
     });
 
     res.status(201).json({
@@ -1242,6 +1346,7 @@ router.post("/bookings/create-order", checkUserAuth, async (req, res) => {
       amount: order.amount,
       currency: order.currency,
       receipt,
+      finalAmount,
     });
   } catch (err) {
     console.error("Order creation failed:", err);
@@ -1324,7 +1429,15 @@ router.post("/bookings/create-order", checkUserAuth, async (req, res) => {
 router.post(
   "/bookings/mock-payment-success",
   checkUserAuth,
+  rejectGuest,
   async (req, res) => {
+    // Block mock payments in production
+    if (process.env.RAZORPAY_TEST_MODE !== "true") {
+      return res.status(403).json({
+        message: "Mock payments are disabled in production",
+      });
+    }
+
     try {
       const { orderId, amount, turfId, vendorId, timeSlot, date, sports } =
         req.body;
@@ -1444,6 +1557,393 @@ router.post(
     }
   }
 );
+
+router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, res) => {
+  let paymentVerified = false;
+  let expectedAmountPaise = 0;
+
+  try {
+    const userId = req.user.uid;
+    const {
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+      bookingDetails,
+      userLocks = [],
+    } = req.body;
+
+    if (process.env.RAZORPAY_TEST_MODE === "true") {
+      return res.status(400).json({
+        message:
+          "RAZORPAY_TEST_MODE is enabled. Disable it to verify real Razorpay payments.",
+      });
+    }
+
+    if (!isRazorpayConfigured()) {
+      return res.status(500).json({
+        message: "Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET",
+      });
+    }
+
+    if (
+      !razorpay_payment_id ||
+      !razorpay_order_id ||
+      !razorpay_signature ||
+      !bookingDetails
+    ) {
+      return res.status(400).json({
+        message:
+          "razorpay_payment_id, razorpay_order_id, razorpay_signature, and bookingDetails are required",
+      });
+    }
+
+    const { vendorId, turfId, sports, selectedSlots, date } = bookingDetails;
+    if (
+      !vendorId ||
+      !turfId ||
+      !sports ||
+      !Array.isArray(selectedSlots) ||
+      selectedSlots.length === 0 ||
+      !date
+    ) {
+      return res.status(400).json({
+        message:
+          "bookingDetails must include vendorId, turfId, sports, selectedSlots, and date",
+      });
+    }
+
+    if (!Array.isArray(userLocks) || userLocks.length === 0) {
+      return res.status(400).json({
+        message: "Active userLocks are required to confirm booking",
+      });
+    }
+
+    const normalizedSport = sports.trim().toLowerCase();
+    const normalizedSlots = selectedSlots.map((slot) => slot.trim());
+
+    const generatedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    const isSignatureValid =
+      generatedSignature.length === razorpay_signature.length &&
+      crypto.timingSafeEqual(
+        Buffer.from(generatedSignature),
+        Buffer.from(razorpay_signature)
+      );
+
+    if (!isSignatureValid) {
+      return res.status(400).json({ message: "Invalid Razorpay signature" });
+    }
+
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+    if (!payment) {
+      return res.status(400).json({ message: "Payment not found on Razorpay" });
+    }
+
+    if (!["authorized", "captured"].includes(payment.status)) {
+      return res.status(400).json({
+        message: `Payment is not successful (status: ${payment.status})`,
+      });
+    }
+
+    if (payment.order_id !== razorpay_order_id) {
+      return res.status(400).json({ message: "Order mismatch for payment" });
+    }
+
+    // Read amount from order notes (locked at creation time) instead of recomputing
+    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+    expectedAmountPaise = Number(razorpayOrder.notes?.amountInPaise || razorpayOrder.amount);
+
+    if (payment.amount !== expectedAmountPaise) {
+      return res.status(400).json({
+        message: "Paid amount does not match booking amount",
+      });
+    }
+
+    // Payment is verified — from this point, if anything fails, we must refund
+    paymentVerified = true;
+
+    // Compute summary for booking metadata (pricePerSlot, turfTitle, etc.)
+    // NOTE: The amount check above uses the order's stored notes, NOT this recomputed value
+    const expectedSummary = await computeBookingSummary({
+      vendorId,
+      turfId,
+      sports: normalizedSport,
+      selectedSlots: normalizedSlots,
+      date,
+    });
+
+    const existingPaymentBookings = await db
+      .collection("bookings")
+      .where("paymentId", "==", razorpay_payment_id)
+      .where("userId", "==", userId)
+      .where("bookingStatus", "==", "confirmed")
+      .get();
+
+    if (!existingPaymentBookings.empty) {
+      const bookingIds = existingPaymentBookings.docs.map((doc) => doc.id);
+      return res.status(200).json({
+        message: "Payment already verified",
+        bookingId: bookingIds[0],
+        bookingIds,
+      });
+    }
+
+    const turfRef = db
+      .collection("vendors")
+      .doc(vendorId)
+      .collection("turfs")
+      .doc(turfId);
+    const turfDoc = await turfRef.get();
+    if (!turfDoc.exists) {
+      return res.status(404).json({ message: "Turf not found" });
+    }
+    const turfData = turfDoc.data();
+
+    const vendorDoc = await db.collection("vendors").doc(vendorId).get();
+    const vendorData = vendorDoc.exists ? vendorDoc.data() : { name: "Unknown Vendor" };
+
+    const userLockIds = userLocks
+      .map((lock) => lock?.lockId)
+      .filter((id) => typeof id === "string" && id.trim());
+
+    // Pre-transaction: check for duplicate bookings (queries not allowed inside transactions)
+    for (const slot of normalizedSlots) {
+      const existingBookingSnapshot = await db
+        .collection("bookings")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sports", "==", normalizedSport)
+        .where("date", "==", date)
+        .where("timeSlot", "==", slot)
+        .where("bookingStatus", "==", "confirmed")
+        .limit(1)
+        .get();
+      if (!existingBookingSnapshot.empty) {
+        throw new Error(`Slot already booked: ${slot}`);
+      }
+    }
+
+    // Pre-transaction: validate locks and re-acquire expired ones
+    const now = new Date();
+    const selectedSlotSet = new Set(normalizedSlots);
+    const lockToSlotMap = new Map();
+
+    for (const lockId of userLockIds) {
+      const lockRef = db.collection("slot_locks").doc(lockId);
+      const lockDoc = await lockRef.get();
+      if (!lockDoc.exists) {
+        throw new Error(`Lock not found: ${lockId}`);
+      }
+
+      const lockData = lockDoc.data();
+      const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
+      if (lockData.userId !== userId) {
+        throw new Error("Unauthorized lock ownership");
+      }
+      if (
+        lockData.vendorId !== vendorId ||
+        lockData.turfId !== turfId ||
+        (lockData.sport || "").trim().toLowerCase() !== normalizedSport ||
+        lockData.date !== date
+      ) {
+        throw new Error("Lock details do not match selected booking details");
+      }
+
+      const slot = (lockData.timeSlot || "").trim();
+      if (!selectedSlotSet.has(slot)) {
+        throw new Error("Lock does not match selected slots");
+      }
+
+      // If lock is expired or no longer active, try to re-acquire
+      if (lockData.status !== "locked" || expiresAt <= now) {
+        // Check if slot is still available (not locked by someone else)
+        const conflictSnapshot = await db
+          .collection("slot_locks")
+          .where("vendorId", "==", vendorId)
+          .where("turfId", "==", turfId)
+          .where("sport", "==", normalizedSport)
+          .where("date", "==", date)
+          .where("timeSlot", "==", slot)
+          .where("status", "==", "locked")
+          .get();
+
+        const activeConflict = conflictSnapshot.docs.some((doc) => {
+          if (doc.id === lockId) return false; // skip our own lock
+          const d = doc.data();
+          const exp = d.expiresAt?.toDate?.() || new Date(d.expiresAt);
+          return exp > now && d.userId !== userId;
+        });
+
+        if (activeConflict) {
+          throw new Error(`Slot ${slot} is now locked by another user. Refund will be issued.`);
+        }
+
+        // Re-acquire: extend the lock
+        const newExpiresAt = new Date(now.getTime() + 10 * 60 * 1000);
+        await lockRef.update({
+          status: "locked",
+          expiresAt: newExpiresAt,
+          lockedAt: now,
+        });
+        console.log(`Lock ${lockId} re-acquired for slot ${slot}`);
+      }
+
+      lockToSlotMap.set(slot, lockRef);
+    }
+
+    if (lockToSlotMap.size !== selectedSlotSet.size) {
+      throw new Error("All selected slots must be actively locked before payment verification");
+    }
+
+    const bookingIds = await db.runTransaction(async (transaction) => {
+      // Re-read locks inside transaction to ensure consistency
+      for (const [slot, lockRef] of lockToSlotMap) {
+        const lockDoc = await transaction.get(lockRef);
+        if (!lockDoc.exists) throw new Error(`Lock disappeared: ${slot}`);
+        const lockData = lockDoc.data();
+        if (lockData.status !== "locked" || lockData.userId !== userId) {
+          throw new Error(`Lock for slot ${slot} is no longer valid`);
+        }
+      }
+
+      const createdBookingIds = [];
+      const slotStatusRef = db
+        .collection("vendors")
+        .doc(vendorId)
+        .collection("turfs")
+        .doc(turfId)
+        .collection("slotStatus")
+        .doc(date);
+      const createdAt = new Date().toISOString();
+
+      for (const slot of normalizedSlots) {
+
+        const bookingRef = db.collection("bookings").doc();
+        transaction.set(bookingRef, {
+          orderId: razorpay_order_id,
+          paymentId: razorpay_payment_id,
+          userId,
+          createdAt,
+          vendorId,
+          vendorName: vendorData.name || "Unknown Vendor",
+          turfId,
+          turfName: turfData.title || "Turf",
+          turfLocation: turfData.address || "",
+          locationCoordinates: turfData.location || null,
+          date,
+          timeSlot: slot,
+          sports: normalizedSport,
+          amount: expectedSummary.pricePerSlot,
+          finalAmount: expectedSummary.finalAmount,
+          paymentStatus: "confirmed",
+          bookingStatus: "confirmed",
+          slotCount: normalizedSlots.length,
+          currency: "INR",
+        });
+        createdBookingIds.push(bookingRef.id);
+
+        transaction.set(
+          slotStatusRef,
+          {
+            [normalizedSport]: {
+              [slot]: {
+                booked: true,
+                bookingId: bookingRef.id,
+                userId,
+              },
+            },
+          },
+          { merge: true }
+        );
+
+        const lockRef = lockToSlotMap.get(slot);
+        transaction.update(lockRef, {
+          status: "confirmed",
+          confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+          bookingId: bookingRef.id,
+          paymentId: razorpay_payment_id,
+        });
+      }
+
+      return createdBookingIds;
+    });
+
+    await db.collection("notifications").add({
+      userId,
+      title: "Booking Confirmed",
+      message: `Your booking at ${expectedSummary.turfTitle || turfData.title} on ${date} is confirmed.`,
+      read: false,
+      createdAt: new Date().toISOString(),
+      type: "booking",
+      bookingIds,
+    });
+
+    return res.status(200).json({
+      message: "Payment verified and booking created successfully",
+      bookingId: bookingIds[0],
+      bookingIds,
+      amount: expectedSummary.finalAmount,
+    });
+  } catch (err) {
+    console.error("Payment verification error:", err);
+    const message = err.message || "Internal server error";
+    const isClientError =
+      message.includes("Lock") ||
+      message.includes("lock") ||
+      message.includes("already booked") ||
+      message.includes("Unauthorized") ||
+      message.includes("expired") ||
+      message.includes("selected slots");
+    const status = message.includes("already booked")
+      ? 409
+      : isClientError
+      ? 400
+      : 500;
+
+    // Auto-refund if payment was already verified but booking failed
+    const { razorpay_payment_id, bookingDetails } = req.body;
+    let refundStatus = null;
+    if (paymentVerified && razorpay_payment_id) {
+      try {
+        const refund = await razorpay.payments.refund(razorpay_payment_id, {
+          amount: expectedAmountPaise,
+          notes: {
+            reason: "Booking failed after payment verification",
+            error: message,
+          },
+        });
+        refundStatus = { refunded: true, refundId: refund.id, amount: expectedAmountPaise };
+        console.log(`Refund issued for payment ${razorpay_payment_id}: refund ${refund.id}`);
+      } catch (refundErr) {
+        refundStatus = { refunded: false, error: refundErr.message };
+        console.error(`Refund FAILED for payment ${razorpay_payment_id}:`, refundErr);
+      }
+
+      // Write to failed_bookings collection for audit trail
+      try {
+        await db.collection("failed_bookings").add({
+          razorpay_payment_id,
+          razorpay_order_id: req.body.razorpay_order_id,
+          userId: req.user.uid,
+          bookingDetails: bookingDetails || null,
+          failureReason: message,
+          refundStatus,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (auditErr) {
+        console.error("Failed to write audit log:", auditErr);
+      }
+    }
+
+    return res.status(status).json({
+      message,
+      refundStatus,
+    });
+  }
+});
 
 // routes/users.js or routes/bookings.js
 
@@ -1616,7 +2116,7 @@ router.get("/users/my-bookings", checkUserAuth, async (req, res) => {
 //   }
 // );
 
-router.post("/cancel-booking", checkUserAuth, async (req, res) => {
+router.post("/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const { bookingId } = req.body;
 
@@ -1838,7 +2338,7 @@ function parseHour(timeStr) {
   return parseInt(timeStr.split(":")[0], 10); // "23:00" → 23
 }
 
-router.post("/bookings/cancel-booking", checkUserAuth, async (req, res) => {
+router.post("/bookings/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
   const { bookingId, currentTime } = req.body;
   const userId = req.user.uid;
 
@@ -1940,3 +2440,4 @@ router.post("/bookings/cancel-booking", checkUserAuth, async (req, res) => {
 });
 
 module.exports = router;
+

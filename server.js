@@ -28,4 +28,35 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+
+  // Automatic cleanup of expired slot locks every 60 minutes
+  const { db } = require("./firebase/firebase");
+  const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+  const cleanupExpiredLocks = async () => {
+    try {
+      const now = new Date();
+      const expiredSnapshot = await db
+        .collection("slot_locks")
+        .where("status", "==", "locked")
+        .where("expiresAt", "<=", now)
+        .get();
+
+      if (expiredSnapshot.empty) {
+        console.log("[Lock Cleanup] No expired locks found");
+        return;
+      }
+
+      const batch = db.batch();
+      expiredSnapshot.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      console.log(`[Lock Cleanup] Cleaned up ${expiredSnapshot.size} expired locks`);
+    } catch (err) {
+      console.error("[Lock Cleanup] Error:", err.message);
+    }
+  };
+
+  // Run initial cleanup after 1 minute, then every hour
+  setTimeout(cleanupExpiredLocks, 60 * 1000);
+  setInterval(cleanupExpiredLocks, CLEANUP_INTERVAL_MS);
 });

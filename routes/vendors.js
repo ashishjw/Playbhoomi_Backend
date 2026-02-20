@@ -68,18 +68,27 @@ router.get("/vendors/dashboard", checkVendorAuth, async (req, res) => {
 
     let totalBookings = 0;
     let totalEarnings = 0;
-    const bookings = [];
 
+    // Batch-fetch all unique users in one call instead of N+1 sequential reads
+    const uniqueUserIds = [...new Set(snapshot.docs.map((doc) => doc.data().userId).filter(Boolean))];
+    const userMap = {};
+    if (uniqueUserIds.length > 0) {
+      const userRefs = uniqueUserIds.map((uid) => db.collection("users").doc(uid));
+      const userDocs = await db.getAll(...userRefs);
+      userDocs.forEach((userDoc) => {
+        if (userDoc.exists) {
+          userMap[userDoc.id] = userDoc.data();
+        }
+      });
+    }
+
+    const bookings = [];
     for (const doc of snapshot.docs) {
       const data = doc.data();
       totalBookings += 1;
       totalEarnings += data.amount || 0;
 
-      // 🔍 Fetch user info from Firestore
-      const userDoc = await db.collection("users").doc(data.userId).get();
-      const user = userDoc.exists
-        ? userDoc.data()
-        : { name: "Unknown", phone: "N/A" };
+      const user = userMap[data.userId] || { name: "Unknown", phone: "N/A" };
 
       bookings.push({
         bookingId: doc.id,

@@ -3,6 +3,7 @@ const router = express.Router();
 const { db } = require("../firebase/firebase");
 const { v4: uuidv4 } = require("uuid");
 const checkUserAuth = require("../middleware/checkUserAuth");
+const { rejectGuest } = require("../middleware/checkUserAuth");
 
 // Lock expiration time in minutes
 const LOCK_EXPIRATION_MINUTES = 10;
@@ -10,7 +11,7 @@ const LOCK_EXPIRATION_MINUTES = 10;
 // ============================================
 // 1. LOCK A SLOT (when user selects it)
 // ============================================
-router.post("/slots/lock", checkUserAuth, async (req, res) => {
+router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const { vendorId, turfId, sport, date, timeSlot } = req.body;
     const userId = req.user.uid;
@@ -120,7 +121,7 @@ router.post("/slots/lock", checkUserAuth, async (req, res) => {
 // ============================================
 // 2. RELEASE LOCK (when user deselects or times out)
 // ============================================
-router.delete("/slots/unlock/:lockId", checkUserAuth, async (req, res) => {
+router.delete("/slots/unlock/:lockId", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const { lockId } = req.params;
     const userId = req.user.uid;
@@ -134,6 +135,10 @@ router.delete("/slots/unlock/:lockId", checkUserAuth, async (req, res) => {
 
     if (lockDoc.data().userId !== userId) {
       return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    if (lockDoc.data().status !== "locked") {
+      return res.status(409).json({ message: "Only active locks can be released" });
     }
 
     await lockRef.delete();
@@ -232,7 +237,7 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
 // ============================================
 // 4. CONFIRM LOCK (after successful payment)
 // ============================================
-router.patch("/slots/confirm/:lockId", checkUserAuth, async (req, res) => {
+router.patch("/slots/confirm/:lockId", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const { lockId } = req.params;
     const userId = req.user.uid;
@@ -325,7 +330,7 @@ router.get("/slots/my-locks", checkUserAuth, async (req, res) => {
 // ============================================
 // 7. RELEASE ALL USER LOCKS (for cleanup on logout/app close)
 // ============================================
-router.delete("/slots/release-all", checkUserAuth, async (req, res) => {
+router.delete("/slots/release-all", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const userId = req.user.uid;
 

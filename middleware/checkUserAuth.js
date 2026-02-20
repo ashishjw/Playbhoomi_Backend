@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 
-module.exports = function (req, res, next) {
+const checkUserAuth = function (req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -16,3 +16,13 @@ module.exports = function (req, res, next) {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 };
+
+const rejectGuest = function (req, res, next) {
+  if (req.user && req.user.role === "guest") {
+    return res.status(403).json({ message: "Please login to access this feature" });
+  }
+  next();
+};
+
+module.exports = checkUserAuth;
+module.exports.rejectGuest = rejectGuest;
