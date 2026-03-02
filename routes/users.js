@@ -10,6 +10,7 @@ const checkUserAuth = require("../middleware/checkUserAuth");
 const { rejectGuest } = require("../middleware/checkUserAuth");
 const PDFDocument = require("pdfkit");
 const stream = require("stream-buffers");
+const { createNotification, sendBookingConfirmedNotification, sendPaymentSuccessNotification } = require("../utils/notificationHelper");
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || "",
@@ -407,42 +408,29 @@ router.post("/users/nearby-venues", async (req, res) => {
   try {
     const vendorsSnapshot = await db.collection("vendors").get();
 
-    let nearbyTurfs = [];
+    const vendorTurfArrays = await Promise.all(
+      vendorsSnapshot.docs.map(async (vendorDoc) => {
+        const vendorData = vendorDoc.data();
+        const turfsSnapshot = await db
+          .collection("vendors")
+          .doc(vendorDoc.id)
+          .collection("turfs")
+          .get();
 
-    for (const vendorDoc of vendorsSnapshot.docs) {
-      const vendorData = vendorDoc.data();
-      const vendorId = vendorDoc.id;
+        const turfs = [];
+        turfsSnapshot.forEach((turfDoc) => {
+          const turfData = turfDoc.data();
+          if (!turfData.vendorCoordinates) return;
 
-      const turfsSnapshot = await db
-        .collection("vendors")
-        .doc(vendorId)
-        .collection("turfs")
-        .get();
-
-      turfsSnapshot.forEach((turfDoc) => {
-        const turfData = turfDoc.data();
-        console.log('🔎 [DEBUG] Turf data:', turfDoc.id, {
-          title: turfData.title,
-          hasCoordinates: !!turfData.coordinates,
-          hasVendorCoordinates: !!turfData.vendorCoordinates,
-          vendorCoordinates: turfData.vendorCoordinates,
-          allFields: Object.keys(turfData)
-        });
-
-        // Check for vendorCoordinates field (Admin Panel saves as vendorCoordinates)
-        if (turfData.vendorCoordinates) {
-          console.log('✅ [DEBUG] Turf has vendorCoordinates:', turfData.vendorCoordinates);
           const dist = getDistance(
             userLocation.latitude,
             userLocation.longitude,
             turfData.vendorCoordinates.lat,
             turfData.vendorCoordinates.lng
           );
-          console.log('📏 [DEBUG] Distance:', dist, 'km');
 
-          // Temporarily increased to 5000km for testing - change back to 50 later
-          if (dist <= 5000) {
-            nearbyTurfs.push({
+          if (dist <= 50) {
+            turfs.push({
               turfId: turfDoc.id,
               title: turfData.title,
               address: turfData.address,
@@ -459,16 +447,13 @@ router.post("/users/nearby-venues", async (req, res) => {
               createdAt: turfData.createdAt,
               distance: parseFloat(dist.toFixed(2)),
             });
-            console.log('✅ [DEBUG] Added turf to results');
-          } else {
-            console.log('❌ [DEBUG] Turf too far:', dist, 'km');
           }
-        } else {
-          console.log('❌ [DEBUG] Turf has no vendorCoordinates field');
-        }
-      });
-    }
+        });
+        return turfs;
+      })
+    );
 
+    const nearbyTurfs = vendorTurfArrays.flat();
     return res.status(200).json(nearbyTurfs);
   } catch (err) {
     console.error("Error fetching nearby turfs:", err);
@@ -504,59 +489,61 @@ router.post("/users/search-turfs", async (req, res) => {
 
   try {
     const vendorsSnapshot = await db.collection("vendors").get();
-    let results = [];
 
-    for (const vendorDoc of vendorsSnapshot.docs) {
-      const vendorData = vendorDoc.data();
-      const turfsSnapshot = await db
-        .collection("vendors")
-        .doc(vendorDoc.id)
-        .collection("turfs")
-        .get();
+    const vendorTurfArrays = await Promise.all(
+      vendorsSnapshot.docs.map(async (vendorDoc) => {
+        const vendorData = vendorDoc.data();
+        const turfsSnapshot = await db
+          .collection("vendors")
+          .doc(vendorDoc.id)
+          .collection("turfs")
+          .get();
 
-      turfsSnapshot.forEach((turfDoc) => {
-        const turf = turfDoc.data();
+        const turfs = [];
+        turfsSnapshot.forEach((turfDoc) => {
+          const turf = turfDoc.data();
 
-        // Match by turf title or sports name
-        const matchesTitle = turf.title.toLowerCase().includes(lowerKeyword);
-        const matchesSport =
-          Array.isArray(turf.sports) &&
-          turf.sports.some((s) => s.name.toLowerCase().includes(lowerKeyword));
+          const matchesTitle = turf.title?.toLowerCase().includes(lowerKeyword);
+          const matchesSport =
+            Array.isArray(turf.sports) &&
+            turf.sports.some((s) => s.name.toLowerCase().includes(lowerKeyword));
 
-        if ((matchesTitle || matchesSport) && turf.vendorCoordinates) {
-          const dist = getDistanceFromLatLonInKm(
-            latitude,
-            longitude,
-            turf.vendorCoordinates.lat,
-            turf.vendorCoordinates.lng
-          );
+          if ((matchesTitle || matchesSport) && turf.vendorCoordinates) {
+            const dist = getDistanceFromLatLonInKm(
+              latitude,
+              longitude,
+              turf.vendorCoordinates.lat,
+              turf.vendorCoordinates.lng
+            );
 
-          // Temporarily increased to 5000km for testing - change back to 50 later
-          if (dist <= 5000) {
-            const minPrice = Math.min(...turf.sports.map((s) => s.slotPrice));
-            const maxPrice = Math.max(...turf.sports.map((s) => s.slotPrice));
+            if (dist <= 50) {
+              const minPrice = Math.min(...turf.sports.map((s) => s.slotPrice));
+              const maxPrice = Math.max(...turf.sports.map((s) => s.slotPrice));
 
-            results.push({
-              turfId: turfDoc.id,
-              title: turf.title,
-              address: turf.address,
-              vendorName: vendorData.name,
-              phone: vendorData.phone,
-              location: { latitude: turf.vendorCoordinates.lat, longitude: turf.vendorCoordinates.lng },
-              sports: turf.sports,
-              priceRange: { min: minPrice, max: maxPrice },
-              amenities: turf.amenities,
-              courts: turf.courts,
-              images: turf.images,
-              description: turf.description,
-              distance: parseFloat(dist.toFixed(2)),
-              createdAt: turf.createdAt,
-            });
+              turfs.push({
+                turfId: turfDoc.id,
+                title: turf.title,
+                address: turf.address,
+                vendorName: vendorData.name,
+                phone: vendorData.phone,
+                location: { latitude: turf.vendorCoordinates.lat, longitude: turf.vendorCoordinates.lng },
+                sports: turf.sports,
+                priceRange: { min: minPrice, max: maxPrice },
+                amenities: turf.amenities,
+                courts: turf.courts,
+                images: turf.images,
+                description: turf.description,
+                distance: parseFloat(dist.toFixed(2)),
+                createdAt: turf.createdAt,
+              });
+            }
           }
-        }
-      });
-    }
+        });
+        return turfs;
+      })
+    );
 
+    const results = vendorTurfArrays.flat();
     return res.status(200).json(results);
   } catch (err) {
     console.error("Search error:", err);
@@ -594,76 +581,64 @@ router.post("/users/filter-turfs", async (req, res) => {
 
   try {
     const vendorsSnapshot = await db.collection("vendors").get();
-    let filteredTurfs = [];
 
-    for (const vendorDoc of vendorsSnapshot.docs) {
-      const vendorData = vendorDoc.data();
-      const turfsSnapshot = await db
-        .collection("vendors")
-        .doc(vendorDoc.id)
-        .collection("turfs")
-        .get();
+    const vendorTurfArrays = await Promise.all(
+      vendorsSnapshot.docs.map(async (vendorDoc) => {
+        const vendorData = vendorDoc.data();
+        const turfsSnapshot = await db
+          .collection("vendors")
+          .doc(vendorDoc.id)
+          .collection("turfs")
+          .get();
 
-      turfsSnapshot.forEach((turfDoc) => {
-        const turf = turfDoc.data();
+        const turfs = [];
+        turfsSnapshot.forEach((turfDoc) => {
+          const turf = turfDoc.data();
 
-        if (!turf.vendorCoordinates) return;
+          if (!turf.vendorCoordinates) return;
 
-        const dist = getDistanceFromLatLonInKm(
-          latitude,
-          longitude,
-          turf.vendorCoordinates.lat,
-          turf.vendorCoordinates.lng
-        );
+          const dist = getDistanceFromLatLonInKm(
+            latitude,
+            longitude,
+            turf.vendorCoordinates.lat,
+            turf.vendorCoordinates.lng
+          );
 
-        if (dist > maxDistanceKm) return;
+          if (dist > maxDistanceKm) return;
 
-        // 🎯 Sports Type Match
-        if (
-          sportsType &&
-          !turf.sports.some(
-            (s) => s.name.toLowerCase() === sportsType.toLowerCase()
-          )
-        )
-          return;
+          if (sportsType && !turf.sports.some((s) => s.name.toLowerCase() === sportsType.toLowerCase())) return;
 
-        // 💰 Price Range Match
-        const allPrices = turf.sports.map((s) => s.slotPrice);
-        const minPrice = Math.min(...allPrices);
-        const maxPrice = Math.max(...allPrices);
+          const allPrices = turf.sports.map((s) => s.slotPrice);
+          const minPrice = Math.min(...allPrices);
+          const maxPrice = Math.max(...allPrices);
 
-        if (
-          (priceMin && maxPrice < priceMin) ||
-          (priceMax && minPrice > priceMax)
-        )
-          return;
+          if ((priceMin && maxPrice < priceMin) || (priceMax && minPrice > priceMax)) return;
 
-        // ⏱️ Time Slot Match
-        if (startSlot && endSlot) {
-          const matchesTimeSlot = turf.timeSlots.some((slot) => {
-            return slot.open < endSlot && slot.close > startSlot;
+          if (startSlot && endSlot) {
+            const matchesTimeSlot = turf.timeSlots.some((slot) => slot.open < endSlot && slot.close > startSlot);
+            if (!matchesTimeSlot) return;
+          }
+
+          turfs.push({
+            turfId: turfDoc.id,
+            title: turf.title,
+            distance: parseFloat(dist.toFixed(2)),
+            vendorName: vendorData.name,
+            phone: vendorData.phone,
+            address: turf.address,
+            images: turf.images,
+            sports: turf.sports,
+            priceRange: { min: minPrice, max: maxPrice },
+            timeSlots: turf.timeSlots,
+            courts: turf.courts,
+            amenities: turf.amenities,
           });
-          if (!matchesTimeSlot) return;
-        }
-
-        // ✅ Add Turf
-        filteredTurfs.push({
-          turfId: turfDoc.id,
-          title: turf.title,
-          distance: parseFloat(dist.toFixed(2)),
-          vendorName: vendorData.name,
-          phone: vendorData.phone,
-          address: turf.address,
-          images: turf.images,
-          sports: turf.sports,
-          priceRange: { min: minPrice, max: maxPrice },
-          timeSlots: turf.timeSlots,
-          courts: turf.courts,
-          amenities: turf.amenities,
         });
-      });
-    }
+        return turfs;
+      })
+    );
 
+    const filteredTurfs = vendorTurfArrays.flat();
     return res.status(200).json(filteredTurfs);
   } catch (err) {
     console.error("Filter error:", err);
@@ -1533,18 +1508,21 @@ router.post(
         { merge: true }
       );
 
-      const notificationRef = db
-        .collection("users")
-        .doc(userId)
-        .collection("notifications")
-        .doc();
-
-      await notificationRef.set({
-        title: "Booking Confirmed ✅",
-        message: `Your booking is confirmed at ${turfData.title}, ${turfData.address} on ${date} at ${timeSlot}.`,
-        read: false,
-        createdAt: new Date().toISOString(),
-      });
+      try {
+        await sendBookingConfirmedNotification(userId, {
+          bookingId,
+          turfName: turfData.title,
+          date,
+          timeSlot,
+        });
+        await sendPaymentSuccessNotification(userId, {
+          bookingId,
+          amount,
+          paymentId: orderId,
+        });
+      } catch (notifErr) {
+        console.error("[Notification] Failed to send mock booking notifications:", notifErr.message);
+      }
 
       res.status(200).json({
         message: "Mock payment verified and booking saved",
@@ -1871,15 +1849,24 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       return createdBookingIds;
     });
 
-    await db.collection("notifications").add({
-      userId,
-      title: "Booking Confirmed",
-      message: `Your booking at ${expectedSummary.turfTitle || turfData.title} on ${date} is confirmed.`,
-      read: false,
-      createdAt: new Date().toISOString(),
-      type: "booking",
-      bookingIds,
-    });
+    try {
+      const turfTitle = expectedSummary.turfTitle || turfData.title;
+      const timeSlotLabel = normalizedSlots.join(", ");
+      await createNotification(
+        userId,
+        "Booking Confirmed! 🎉",
+        `Your booking for ${turfTitle} on ${date} at ${timeSlotLabel} has been confirmed.`,
+        "booking_confirmed",
+        { bookingIds, turfName: turfTitle, date, timeSlot: timeSlotLabel }
+      );
+      await sendPaymentSuccessNotification(userId, {
+        bookingId: bookingIds[0],
+        amount: expectedSummary.finalAmount,
+        paymentId: razorpay_payment_id,
+      });
+    } catch (notifErr) {
+      console.error("[Notification] Failed to send booking notifications:", notifErr.message);
+    }
 
     return res.status(200).json({
       message: "Payment verified and booking created successfully",
@@ -2250,28 +2237,6 @@ router.put("/users/profile", checkUserAuth, async (req, res) => {
   }
 });
 
-router.get("/users/notifications", checkUserAuth, async (req, res) => {
-  const userId = req.user.uid;
-
-  try {
-    const snapshot = await db
-      .collection("users")
-      .doc(userId)
-      .collection("notifications")
-      .orderBy("createdAt", "desc")
-      .get();
-
-    const notifications = snapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
-    res.status(200).json({ notifications });
-  } catch (err) {
-    console.error("Fetch notifications error:", err);
-    res.status(500).json({ message: "Internal server error" });
-  }
-});
 
 router.post("/notifications/reminders", async (req, res) => {
   try {
@@ -2298,18 +2263,13 @@ router.post("/notifications/reminders", async (req, res) => {
 
     // Send reminders
     for (const booking of reminders) {
-      const notificationRef = db
-        .collection("users")
-        .doc(booking.userId)
-        .collection("notifications")
-        .doc();
-
-      await notificationRef.set({
-        title: "⏰ Booking Reminder",
-        message: `Reminder: Your booking at ${booking.turfName} (${booking.turfLocation}) is today at ${booking.timeSlot}.`,
-        read: false,
-        createdAt: new Date().toISOString(),
-      });
+      await createNotification(
+        booking.userId,
+        "⏰ Booking Reminder",
+        `Reminder: Your booking at ${booking.turfName} (${booking.turfLocation}) is today at ${booking.timeSlot}.`,
+        "booking_reminder",
+        { bookingId: booking.bookingId, turfName: booking.turfName, timeSlot: booking.timeSlot }
+      );
     }
 
     res.status(200).json({

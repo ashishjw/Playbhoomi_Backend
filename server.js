@@ -59,4 +59,58 @@ app.listen(PORT, () => {
   // Run initial cleanup after 1 minute, then every hour
   setTimeout(cleanupExpiredLocks, 60 * 1000);
   setInterval(cleanupExpiredLocks, CLEANUP_INTERVAL_MS);
+
+  // Booking reminder notifications — runs every 2 hours
+  const { createNotification } = require("./utils/notificationHelper");
+  const REMINDER_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+  const sendBookingReminders = async () => {
+    try {
+      const now = new Date();
+      const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+      const dateStr = twoHoursLater.toISOString().split("T")[0];
+
+      const bookingsSnapshot = await db
+        .collection("bookings")
+        .where("date", "==", dateStr)
+        .where("bookingStatus", "==", "confirmed")
+        .get();
+
+      if (bookingsSnapshot.empty) {
+        console.log("[Reminder] No bookings found for reminder window");
+        return;
+      }
+
+      let sent = 0;
+      for (const doc of bookingsSnapshot.docs) {
+        const booking = doc.data();
+        if (!booking.timeSlot) continue;
+
+        const [start] = booking.timeSlot.split(" - ");
+        const [slotHour, slotMin] = start.split(":").map(Number);
+        const slotTime = new Date(twoHoursLater);
+        slotTime.setHours(slotHour, slotMin, 0, 0);
+
+        const diff = slotTime.getTime() - now.getTime();
+        const isWithin2Hours = diff > 0 && diff <= 2 * 60 * 60 * 1000 + 15 * 60 * 1000;
+        if (!isWithin2Hours) continue;
+
+        await createNotification(
+          booking.userId,
+          "⏰ Booking Reminder",
+          `Reminder: Your booking at ${booking.turfName} (${booking.turfLocation}) is today at ${booking.timeSlot}.`,
+          "booking_reminder",
+          { bookingId: doc.id, turfName: booking.turfName, timeSlot: booking.timeSlot }
+        );
+        sent++;
+      }
+
+      console.log(`[Reminder] Sent ${sent} reminder notification(s)`);
+    } catch (err) {
+      console.error("[Reminder] Error sending reminders:", err.message);
+    }
+  };
+
+  // Run reminder check every 2 hours
+  setInterval(sendBookingReminders, REMINDER_INTERVAL_MS);
 });
