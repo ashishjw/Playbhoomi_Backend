@@ -1552,6 +1552,7 @@ router.post(
 router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, res) => {
   let paymentVerified = false;
   let expectedAmountPaise = 0;
+  let razorpayPaymentStatus = null; // track so catch block can capture before refunding
 
   try {
     const userId = req.user.uid;
@@ -1632,6 +1633,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
     if (!payment) {
       return res.status(400).json({ message: "Payment not found on Razorpay" });
     }
+    razorpayPaymentStatus = payment.status;
 
     if (!["authorized", "captured"].includes(payment.status)) {
       return res.status(400).json({
@@ -1735,7 +1737,10 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       const lockRef = db.collection("slot_locks").doc(lockId);
       const lockDoc = await lockRef.get();
       if (!lockDoc.exists) {
-        throw new Error(`Lock not found: ${lockId}`);
+        // Lock was cleaned up after expiry. Payment is already verified and
+        // duplicate booking was checked above — log and skip this lock.
+        console.warn(`Lock ${lockId} not found (likely expired after payment). Continuing with verified payment.`);
+        continue;
       }
 
       const lockData = lockDoc.data();
@@ -1794,15 +1799,23 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       lockToSlotMap.set(slot, lockRef);
     }
 
-    if (lockToSlotMap.size !== selectedSlotSet.size) {
-      throw new Error("All selected slots must be actively locked before payment verification");
+    // Fill in any slots whose locks were cleaned up (payment already verified above)
+    for (const slot of normalizedSlots) {
+      if (!lockToSlotMap.has(slot)) {
+        lockToSlotMap.set(slot, null); // null = lock expired, slot booking proceeds via payment trust
+      }
     }
 
     const bookingIds = await db.runTransaction(async (transaction) => {
       // Re-read locks inside transaction to ensure consistency
       for (const [slot, lockRef] of lockToSlotMap) {
+        if (!lockRef) continue; // lock was cleaned up after expiry; payment already verified
         const lockDoc = await transaction.get(lockRef);
-        if (!lockDoc.exists) throw new Error(`Lock disappeared: ${slot}`);
+        if (!lockDoc.exists) {
+          // Lock cleaned up between pre-check and transaction — safe to skip
+          console.warn(`Lock disappeared inside transaction for slot ${slot}; payment was verified`);
+          continue;
+        }
         const lockData = lockDoc.data();
         if (lockData.status !== "locked" || lockData.userId !== userId) {
           throw new Error(`Lock for slot ${slot} is no longer valid`);
@@ -1924,6 +1937,14 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
     let refundStatus = null;
     if (paymentVerified && razorpay_payment_id) {
       try {
+        // Razorpay can only refund captured payments — capture first if still authorized
+        if (razorpayPaymentStatus === "authorized") {
+          await razorpay.payments.capture(razorpay_payment_id, {
+            amount: expectedAmountPaise,
+            currency: "INR",
+          });
+          console.log(`Captured authorized payment ${razorpay_payment_id} before refunding`);
+        }
         const refund = await razorpay.payments.refund(razorpay_payment_id, {
           amount: expectedAmountPaise,
           notes: {
