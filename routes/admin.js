@@ -752,28 +752,34 @@ router.get("/vendors/:id/turfs", checkAdminAuth, async (req, res) => {
     turfSnapshot.forEach((doc) => {
       const turf = doc.data();
 
-      // Calculate openTime, closeTime from all timeSlots
-      const openTimes = turf.timeSlots.map((slot) => slot.open);
-      const closeTimes = turf.timeSlots.map((slot) => slot.close);
-
-      const openTime = openTimes.sort()[0];
-      const closeTime = closeTimes.sort().reverse()[0];
+      // openTime/closeTime: try root timeSlots first (old format), then first sport's timeSlots
+      const rootSlots = turf.timeSlots || turf.sports?.[0]?.timeSlots || [];
+      const openTimes = rootSlots.map((slot) => slot.open).filter(Boolean);
+      const closeTimes = rootSlots.map((slot) => slot.close).filter(Boolean);
+      const openTime = openTimes.length ? openTimes.sort()[0] : null;
+      const closeTime = closeTimes.length ? closeTimes.sort().reverse()[0] : null;
 
       turfs.push({
         turfId: doc.id,
+        vendorId,
         title: turf.title,
+        address: turf.address,
+        description: turf.description,
         vendorName: vendorData.name,
         phone: vendorData.phone,
         location: vendorData.location,
-        description: turf.description,
+        sports: turf.sports || [],
+        amenities: turf.amenities || [],
+        rules: turf.rules || [],
+        images: turf.images || [],
         courtsCount: turf.courts?.length || 0,
         openTime,
         closeTime,
         createdAt: turf.createdAt,
         thumbnail: turf.images?.[0] || null,
-        cancellationHour: turf.cancellationHour || null, // ✅ New Field
-        featured: turf.featured || false, // ✅ New Field
-        isSuspended: turf.isSuspended || false, // ✅ New Field
+        cancellationHours: turf.cancellationHours || 0,
+        featured: turf.featured || 0,
+        isSuspended: turf.isSuspended || 0,
       });
     });
 
@@ -813,18 +819,26 @@ router.get("/admin/turfs", checkAdminAuth, async (req, res) => {
 
         allTurfs.push({
           turfId: turfDoc.id,
+          vendorId,
           title: turf.title,
+          address: turf.address,
+          description: turf.description,
           vendorName: vendorData.name,
           phone: vendorData.phone,
           location: vendorData.location,
-          description: turf.description,
-          courtsCount: turf.courts?.length || 0,
+          sports: turf.sports || [],
+          amenities: turf.amenities || [],
+          rules: turf.rules || [],
+          images: turf.images || [],
           courts: turf.courts || [],
+          courtsCount: turf.courts?.length || 0,
           openTime,
           closeTime,
           createdAt: turf.createdAt,
           thumbnail: turf.images?.[0] || null,
-          isSuspended: turf.isSuspended || 0, // ✅ Include suspension status
+          cancellationHours: turf.cancellationHours || 0,
+          featured: turf.featured || 0,
+          isSuspended: turf.isSuspended || 0,
         });
       });
     }
@@ -1203,6 +1217,58 @@ router.post("/admin/tax", checkAdminAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Failed to set tax:", err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// GET App Settings (convenienceFee, discountRate, taxRate)
+router.get("/admin/settings", checkAdminAuth, async (_req, res) => {
+  try {
+    const [taxSnap, settingsSnap] = await Promise.all([
+      db.collection("tax").doc("global").get(),
+      db.collection("settings").doc("global").get(),
+    ]);
+    const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
+    const settings = settingsSnap.exists ? settingsSnap.data() : {};
+    res.status(200).json({
+      taxRate,
+      convenienceFee: settings.convenienceFee ?? 35,
+      discountRate: settings.discountRate ?? 10,
+    });
+  } catch (err) {
+    console.error("Failed to get settings:", err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// UPDATE App Settings
+router.put("/admin/settings", checkAdminAuth, async (req, res) => {
+  try {
+    const { taxRate, convenienceFee, discountRate } = req.body;
+    const updates = [];
+
+    if (taxRate !== undefined) {
+      if (taxRate < 0) return res.status(400).json({ message: "Invalid tax rate" });
+      updates.push(db.collection("tax").doc("global").set({ percentage: Number(taxRate) }));
+    }
+
+    const settingsUpdate = {};
+    if (convenienceFee !== undefined) {
+      if (convenienceFee < 0) return res.status(400).json({ message: "Invalid convenience fee" });
+      settingsUpdate.convenienceFee = Number(convenienceFee);
+    }
+    if (discountRate !== undefined) {
+      if (discountRate < 0 || discountRate > 100) return res.status(400).json({ message: "Invalid discount rate" });
+      settingsUpdate.discountRate = Number(discountRate);
+    }
+    if (Object.keys(settingsUpdate).length > 0) {
+      updates.push(db.collection("settings").doc("global").set(settingsUpdate, { merge: true }));
+    }
+
+    await Promise.all(updates);
+    res.status(200).json({ message: "Settings updated successfully", taxRate, convenienceFee, discountRate });
+  } catch (err) {
+    console.error("Failed to update settings:", err);
     res.status(500).json({ message: "Internal server error" });
   }
 });

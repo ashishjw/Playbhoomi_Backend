@@ -62,6 +62,8 @@ app.listen(PORT, () => {
 
   // Booking reminder notifications — runs every 2 hours
   const { createNotification } = require("./utils/notificationHelper");
+  const { sendBookingReminderSMS } = require("./utils/smsHelper");
+  const { sendBookingReminderEmail } = require("./utils/emailHelper");
   const REMINDER_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
   const sendBookingReminders = async () => {
@@ -102,6 +104,13 @@ app.listen(PORT, () => {
           "booking_reminder",
           { bookingId: doc.id, turfName: booking.turfName, timeSlot: booking.timeSlot }
         );
+        const userDoc = await db.collection("users").doc(booking.userId).get();
+        const userData = userDoc.exists ? userDoc.data() : {};
+        const reminderData = { turfName: booking.turfName, date: booking.date, timeSlot: booking.timeSlot };
+        await Promise.allSettled([
+          userData.phone ? sendBookingReminderSMS(userData.phone, reminderData) : Promise.resolve(),
+          userData.email ? sendBookingReminderEmail(userData.email, reminderData) : Promise.resolve(),
+        ]);
         sent++;
       }
 

@@ -11,6 +11,8 @@ const { rejectGuest } = require("../middleware/checkUserAuth");
 const PDFDocument = require("pdfkit");
 const stream = require("stream-buffers");
 const { createNotification, sendBookingConfirmedNotification, sendPaymentSuccessNotification } = require("../utils/notificationHelper");
+const { sendBookingConfirmationSMS, sendBookingReminderSMS } = require("../utils/smsHelper");
+const { sendBookingConfirmationEmail, sendBookingReminderEmail } = require("../utils/emailHelper");
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || "",
@@ -172,12 +174,16 @@ const computeBookingSummary = async ({
   const totalSlots = selectedSlots.length;
   const baseAmount = pricePerSlot * totalSlots;
 
-  const taxSnap = await db.collection("tax").doc("global").get();
+  const [taxSnap, settingsSnap] = await Promise.all([
+    db.collection("tax").doc("global").get(),
+    db.collection("settings").doc("global").get(),
+  ]);
   const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
   const taxAmount = Math.round((baseAmount * taxRate) / 100);
-  const convenienceFee = 35;
+  const settingsData = settingsSnap.exists ? settingsSnap.data() : {};
+  const convenienceFee = settingsData.convenienceFee ?? 35;
+  const discountRate = settingsData.discountRate ?? 10;
   const subtotal = baseAmount + taxAmount + convenienceFee;
-  const discountRate = 10;
   const discountAmount = Math.round((subtotal * discountRate) / 100);
   const finalAmount = subtotal - discountAmount;
 
@@ -1520,6 +1526,13 @@ router.post(
           amount,
           paymentId: orderId,
         });
+        const userDoc = await db.collection("users").doc(userId).get();
+        const userData = userDoc.exists ? userDoc.data() : {};
+        const msgData = { bookingId, turfName: turfData.title, date, timeSlot, amount };
+        await Promise.allSettled([
+          userData.phone ? sendBookingConfirmationSMS(userData.phone, msgData) : Promise.resolve(),
+          userData.email ? sendBookingConfirmationEmail(userData.email, msgData) : Promise.resolve(),
+        ]);
       } catch (notifErr) {
         console.error("[Notification] Failed to send mock booking notifications:", notifErr.message);
       }
@@ -1643,15 +1656,24 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
     // Payment is verified — from this point, if anything fails, we must refund
     paymentVerified = true;
 
-    // Compute summary for booking metadata (pricePerSlot, turfTitle, etc.)
-    // NOTE: The amount check above uses the order's stored notes, NOT this recomputed value
-    const expectedSummary = await computeBookingSummary({
-      vendorId,
-      turfId,
-      sports: normalizedSport,
-      selectedSlots: normalizedSlots,
-      date,
-    });
+    // Derive booking metadata from already-fetched turfData and order notes
+    // (avoids a redundant computeBookingSummary call after payment is verified)
+    const sportData = (turfData.sports || []).find(
+      (s) => s.name.toLowerCase() === normalizedSport
+    );
+    const bookingDay = new Date(date).getDay();
+    const isWeekendBooking = bookingDay === 0 || bookingDay === 6;
+    let pricePerSlot = sportData?.slotPrice || 0;
+    if ((sportData?.discountedPrice || 0) > 0) pricePerSlot = sportData.discountedPrice;
+    if (isWeekendBooking && (sportData?.weekendPrice || 0) > 0) pricePerSlot = sportData.weekendPrice;
+    const verifiedFinalAmount = Number(razorpayOrder.notes?.finalAmount || 0);
+    const turfTitle = turfData.title || "Turf";
+    // Shim so existing references below still work
+    const expectedSummary = {
+      pricePerSlot,
+      finalAmount: verifiedFinalAmount,
+      turfTitle,
+    };
 
     const existingPaymentBookings = await db
       .collection("bookings")
@@ -1864,6 +1886,13 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
         amount: expectedSummary.finalAmount,
         paymentId: razorpay_payment_id,
       });
+      const userDoc = await db.collection("users").doc(userId).get();
+      const userData = userDoc.exists ? userDoc.data() : {};
+      const msgData = { bookingId: bookingIds[0], turfName: turfTitle, date, timeSlot: timeSlotLabel, amount: expectedSummary.finalAmount };
+      await Promise.allSettled([
+        userData.phone ? sendBookingConfirmationSMS(userData.phone, msgData) : Promise.resolve(),
+        userData.email ? sendBookingConfirmationEmail(userData.email, msgData) : Promise.resolve(),
+      ]);
     } catch (notifErr) {
       console.error("[Notification] Failed to send booking notifications:", notifErr.message);
     }
