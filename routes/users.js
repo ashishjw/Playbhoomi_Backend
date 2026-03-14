@@ -612,6 +612,8 @@ router.post("/users/filter-turfs", async (req, res) => {
 
           if (dist > maxDistanceKm) return;
 
+          if (turf.deleted) return;
+
           if (sportsType && !turf.sports.some((s) => s.name.toLowerCase() === sportsType.toLowerCase())) return;
 
           const allPrices = turf.sports.map((s) => s.slotPrice);
@@ -621,7 +623,14 @@ router.post("/users/filter-turfs", async (req, res) => {
           if ((priceMin && maxPrice < priceMin) || (priceMax && minPrice > priceMax)) return;
 
           if (startSlot && endSlot) {
-            const matchesTimeSlot = turf.timeSlots.some((slot) => slot.open < endSlot && slot.close > startSlot);
+            // Check time slots from sports (weekday/weekend) or top-level timeSlots
+            const allTimeSlots = turf.sports.flatMap((s) => [
+              ...(s.weekdayTimeSlots || []),
+              ...(s.weekendTimeSlots || []),
+              ...(s.timeSlots || []),
+            ]);
+            const slotsToCheck = allTimeSlots.length > 0 ? allTimeSlots : (turf.timeSlots || []);
+            const matchesTimeSlot = slotsToCheck.some((slot) => slot.open < endSlot && slot.close > startSlot);
             if (!matchesTimeSlot) return;
           }
 
@@ -632,12 +641,15 @@ router.post("/users/filter-turfs", async (req, res) => {
             vendorName: vendorData.name,
             phone: vendorData.phone,
             address: turf.address,
+            description: turf.description,
             images: turf.images,
             sports: turf.sports,
             priceRange: { min: minPrice, max: maxPrice },
             timeSlots: turf.timeSlots,
             courts: turf.courts,
             amenities: turf.amenities,
+            rules: turf.rules,
+            vendorCoordinates: turf.vendorCoordinates,
           });
         });
         return turfs;
@@ -1658,25 +1670,6 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
     // Payment is verified — from this point, if anything fails, we must refund
     paymentVerified = true;
 
-    // Derive booking metadata from already-fetched turfData and order notes
-    // (avoids a redundant computeBookingSummary call after payment is verified)
-    const sportData = (turfData.sports || []).find(
-      (s) => s.name.toLowerCase() === normalizedSport
-    );
-    const bookingDay = new Date(date).getDay();
-    const isWeekendBooking = bookingDay === 0 || bookingDay === 6;
-    let pricePerSlot = sportData?.slotPrice || 0;
-    if ((sportData?.discountedPrice || 0) > 0) pricePerSlot = sportData.discountedPrice;
-    if (isWeekendBooking && (sportData?.weekendPrice || 0) > 0) pricePerSlot = sportData.weekendPrice;
-    const verifiedFinalAmount = Number(razorpayOrder.notes?.finalAmount || 0);
-    const turfTitle = turfData.title || "Turf";
-    // Shim so existing references below still work
-    const expectedSummary = {
-      pricePerSlot,
-      finalAmount: verifiedFinalAmount,
-      turfTitle,
-    };
-
     const existingPaymentBookings = await db
       .collection("bookings")
       .where("paymentId", "==", razorpay_payment_id)
@@ -1703,6 +1696,23 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       return res.status(404).json({ message: "Turf not found" });
     }
     const turfData = turfDoc.data();
+
+    // Derive booking metadata from turfData and order notes
+    const sportData = (turfData.sports || []).find(
+      (s) => s.name.toLowerCase() === normalizedSport
+    );
+    const bookingDay = new Date(date).getDay();
+    const isWeekendBooking = bookingDay === 0 || bookingDay === 6;
+    let pricePerSlot = sportData?.slotPrice || 0;
+    if ((sportData?.discountedPrice || 0) > 0) pricePerSlot = sportData.discountedPrice;
+    if (isWeekendBooking && (sportData?.weekendPrice || 0) > 0) pricePerSlot = sportData.weekendPrice;
+    const verifiedFinalAmount = Number(razorpayOrder.notes?.finalAmount || 0);
+    const turfTitle = turfData.title || "Turf";
+    const expectedSummary = {
+      pricePerSlot,
+      finalAmount: verifiedFinalAmount,
+      turfTitle,
+    };
 
     const vendorDoc = await db.collection("vendors").doc(vendorId).get();
     const vendorData = vendorDoc.exists ? vendorDoc.data() : { name: "Unknown Vendor" };
@@ -1873,12 +1883,14 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
         );
 
         const lockRef = lockToSlotMap.get(slot);
-        transaction.update(lockRef, {
-          status: "confirmed",
-          confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
-          bookingId: bookingRef.id,
-          paymentId: razorpay_payment_id,
-        });
+        if (lockRef) {
+          transaction.update(lockRef, {
+            status: "confirmed",
+            confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+            bookingId: bookingRef.id,
+            paymentId: razorpay_payment_id,
+          });
+        }
       }
 
       return createdBookingIds;
