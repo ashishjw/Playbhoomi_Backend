@@ -1,10 +1,12 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
 const { db } = require("../firebase/firebase");
 const checkVendorAuth = require("../middleware/checkVendorAuth");
 
-const JWT_SECRET = process.env.JWT_SECRET || "your_vendor_secret"; // secure this in env
+const JWT_SECRET = process.env.JWT_SECRET;
+const BCRYPT_ROUNDS = 10;
 
 router.post("/vendors/login", async (req, res) => {
   const { email, password } = req.body;
@@ -27,9 +29,20 @@ router.post("/vendors/login", async (req, res) => {
     const vendorDoc = vendorSnapshot.docs[0];
     const vendorData = vendorDoc.data();
 
-    // 🔒 You can hash and compare passwords in production
-    if (vendorData.password !== password) {
+    // Compare password (supports both bcrypt hash and legacy plaintext)
+    const isHashed = vendorData.password && vendorData.password.startsWith("$2");
+    const passwordMatch = isHashed
+      ? await bcrypt.compare(password, vendorData.password)
+      : vendorData.password === password;
+
+    if (!passwordMatch) {
       return res.status(401).json({ message: "Invalid email or password" });
+    }
+
+    // Auto-migrate plaintext password to bcrypt hash
+    if (!isHashed) {
+      const hashed = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      await vendorDoc.ref.update({ password: hashed });
     }
 
     // ✅ Generate JWT token

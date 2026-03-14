@@ -1,11 +1,14 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
 const { db } = require("../firebase/firebase");
 const { checkAdminAuth } = require("../middleware/auth");
 const axios = require("axios");
 const { resolveShortUrl, extractLatLngFromUrl } = require("../utils/mapUtils");
 const cloudinary = require("../utils/cloudinary");
+
+const BCRYPT_ROUNDS = 10;
 router.post("/admin/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -26,9 +29,20 @@ router.post("/admin/login", async (req, res) => {
   const adminDoc = snapshot.docs[0];
   const adminData = adminDoc.data();
 
-  // Compare plaintext password
-  if (adminData.password !== password) {
+  // Compare password (supports both bcrypt hash and legacy plaintext)
+  const isHashed = adminData.password && adminData.password.startsWith("$2");
+  const passwordMatch = isHashed
+    ? await bcrypt.compare(password, adminData.password)
+    : adminData.password === password;
+
+  if (!passwordMatch) {
     return res.status(401).json({ message: "Invalid password" });
+  }
+
+  // Auto-migrate plaintext password to bcrypt hash
+  if (!isHashed) {
+    const hashed = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    await adminDoc.ref.update({ password: hashed });
   }
 
   // Generate JWT token
@@ -95,6 +109,7 @@ router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
     const randomId = generateRandomId();
     const email = `vendor_${randomId}@venuemgmt.com`;
     const password = generatePassword();
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
     // 4) Save vendor document
     const newVendorRef = db.collection("vendors").doc(); // auto ID
@@ -102,7 +117,7 @@ router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
       name,
       email,
       phone,
-      password, // plain for now (as you requested)
+      password: hashedPassword, // bcrypt hashed
       location,
       gpsUrl, // store the URL the admin provided
       coordinates: {
@@ -171,7 +186,7 @@ router.put("/admin/vendors/:vendorId", checkAdminAuth, async (req, res) => {
       }
       updateData.email = email;
     }
-    if (password) updateData.password = password;
+    if (password) updateData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
     if (gpsUrl) {
       updateData.gpsUrl = gpsUrl;
 

@@ -1,6 +1,7 @@
 // server.js
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const adminRoutes = require("./routes/admin");
@@ -11,9 +12,57 @@ const slotLockingRoutes = require("./routes/slotLocking");
 
 const app = express();
 
+// CORS — open for mobile apps (CORS is browser-only, doesn't affect native apps)
 app.use(cors());
+
 app.use(express.json({ limit: '50mb' })); // Increased limit for image uploads
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// --- Rate Limiters ---
+
+// Global: 200 requests per minute per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later" },
+});
+app.use(globalLimiter);
+
+// Auth endpoints: 10 attempts per 15 minutes per IP
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many login attempts, please try again after 15 minutes" },
+});
+app.use("/api/admin/login", authLimiter);
+app.use("/api/vendors/login", authLimiter);
+app.use("/api/users/login", authLimiter);
+app.use("/api/users/register", authLimiter);
+app.use("/api/users/guest", authLimiter);
+
+// Slot status polling: 30 requests per minute per IP
+const slotStatusLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many slot status requests, please slow down" },
+});
+app.use("/api/slots/status", slotStatusLimiter);
+
+// Upload: 20 uploads per 10 minutes per IP
+const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many uploads, please try again later" },
+});
+app.use("/api/upload", uploadLimiter);
 
 app.use("/api", adminRoutes);
 app.use("/api", vendorRoutes);
@@ -23,6 +72,17 @@ app.use("/api", slotLockingRoutes);
 
 app.get("/", (req, res) => {
     res.send("Backend is Running");
+});
+
+// Firebase health check — hit this to confirm if Firestore is working
+app.get("/api/health", async (req, res) => {
+  try {
+    const { db } = require("./firebase/firebase");
+    const testDoc = await db.collection("users").limit(1).get();
+    res.json({ status: "ok", firestore: "connected", docsFound: testDoc.size });
+  } catch (err) {
+    res.status(503).json({ status: "error", firestore: "failed", error: err.message });
+  }
 });
 // Start the server
 const PORT = process.env.PORT || 5000;

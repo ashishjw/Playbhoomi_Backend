@@ -8,7 +8,7 @@ const checkUserAuth = require('../middleware/checkUserAuth');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-router.post('/upload', async (req, res) => {
+router.post('/upload', checkUserAuth, async (req, res) => {
   try {
     const { image } = req.body; // Expecting base64 or URL
     if (!image) {

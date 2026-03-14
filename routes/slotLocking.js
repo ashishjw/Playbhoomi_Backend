@@ -8,6 +8,10 @@ const { rejectGuest } = require("../middleware/checkUserAuth");
 // Lock expiration time in minutes
 const LOCK_EXPIRATION_MINUTES = 10;
 
+// In-memory cache for slot status (reduces Firestore reads)
+const slotStatusCache = new Map();
+const CACHE_TTL_MS = 15000; // 15 seconds
+
 // ============================================
 // 1. LOCK A SLOT (when user selects it)
 // ============================================
@@ -89,7 +93,10 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
       }
     }
 
-    // Create new lock
+    // Create new lock — invalidate cache for this turf+date
+    const lockCacheKey = `${vendorId}:${turfId}:${normalizedSport}:${date}`;
+    slotStatusCache.delete(lockCacheKey);
+
     const lockId = uuidv4();
     const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
 
@@ -141,6 +148,11 @@ router.delete("/slots/unlock/:lockId", checkUserAuth, rejectGuest, async (req, r
       return res.status(409).json({ message: "Only active locks can be released" });
     }
 
+    // Invalidate cache for this slot's turf+date
+    const lockData = lockDoc.data();
+    const unlockCacheKey = `${lockData.vendorId}:${lockData.turfId}:${lockData.sport}:${lockData.date}`;
+    slotStatusCache.delete(unlockCacheKey);
+
     await lockRef.delete();
     res.status(200).json({ message: "Lock released" });
   } catch (err) {
@@ -164,68 +176,97 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
 
     const normalizedSport = sport.trim().toLowerCase();
 
-    const slotStatuses = await Promise.all(
-      timeSlots.map(async (slot) => {
+    // Build a cache key for this turf+sport+date combo
+    const cacheKey = `${vendorId}:${turfId}:${normalizedSport}:${date}`;
+    const cached = slotStatusCache.get(cacheKey);
+
+    // Use cache if fresh (< 15 seconds old)
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+      // Personalize per user (own locks show as "selected")
+      const slotStatuses = timeSlots.map((slot) => {
         const normalizedSlot = slot.trim();
+        const cachedSlot = cached.data[normalizedSlot];
+        if (!cachedSlot) return { slot, status: "available" };
 
-        // Check if booked
-        const bookedSnapshot = await db
-          .collection("bookings")
-          .where("vendorId", "==", vendorId)
-          .where("turfId", "==", turfId)
-          .where("sports", "==", normalizedSport)
-          .where("date", "==", date)
-          .where("timeSlot", "==", normalizedSlot)
-          .where("bookingStatus", "==", "confirmed")
-          .limit(1)
-          .get();
-
-        if (!bookedSnapshot.empty) {
-          return { slot, status: "booked" };
+        if (cachedSlot.status === "locked" && cachedSlot.userId === userId) {
+          return { slot, status: "selected", lockId: cachedSlot.lockId, expiresAt: cachedSlot.expiresAt };
         }
+        return { slot, status: cachedSlot.status, ...(cachedSlot.expiresAt && { expiresAt: cachedSlot.expiresAt }) };
+      });
+      return res.status(200).json({ slotStatuses });
+    }
 
-        // Check if locked
-        const lockSnapshot = await db
-          .collection("slot_locks")
-          .where("vendorId", "==", vendorId)
-          .where("turfId", "==", turfId)
-          .where("sport", "==", normalizedSport)
-          .where("date", "==", date)
-          .where("timeSlot", "==", normalizedSlot)
-          .where("status", "==", "locked")
-          .get();
+    // Batch queries: one for bookings, one for locks (instead of per-slot)
+    const [bookedSnapshot, lockSnapshot] = await Promise.all([
+      db.collection("bookings")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sports", "==", normalizedSport)
+        .where("date", "==", date)
+        .where("bookingStatus", "==", "confirmed")
+        .get(),
+      db.collection("slot_locks")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sport", "==", normalizedSport)
+        .where("date", "==", date)
+        .where("status", "==", "locked")
+        .get(),
+    ]);
 
-        // Filter active locks
-        const activeLocks = lockSnapshot.docs.filter((doc) => {
-          const lockData = doc.data();
-          const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
-          return expiresAt > now;
-        });
+    // Index booked slots
+    const bookedSlots = new Set();
+    bookedSnapshot.docs.forEach((doc) => {
+      bookedSlots.add(doc.data().timeSlot);
+    });
 
-        if (activeLocks.length > 0) {
-          const lockData = activeLocks[0].data();
-          const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
+    // Index active locks by slot
+    const locksBySlot = {};
+    lockSnapshot.docs.forEach((doc) => {
+      const lockData = doc.data();
+      const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
+      if (expiresAt > now) {
+        locksBySlot[lockData.timeSlot] = {
+          userId: lockData.userId,
+          lockId: lockData.lockId,
+          expiresAt,
+        };
+      }
+    });
 
-          // If user owns the lock, mark as "selected" instead of "locked"
-          if (lockData.userId === userId) {
-            return {
-              slot,
-              status: "selected",
-              lockId: lockData.lockId,
-              expiresAt,
-            };
-          }
+    // Build cache entry and response
+    const cacheData = {};
+    const slotStatuses = timeSlots.map((slot) => {
+      const normalizedSlot = slot.trim();
 
-          return {
-            slot,
-            status: "locked",
-            expiresAt,
-          };
+      if (bookedSlots.has(normalizedSlot)) {
+        cacheData[normalizedSlot] = { status: "booked" };
+        return { slot, status: "booked" };
+      }
+
+      const lock = locksBySlot[normalizedSlot];
+      if (lock) {
+        cacheData[normalizedSlot] = { status: "locked", userId: lock.userId, lockId: lock.lockId, expiresAt: lock.expiresAt };
+        if (lock.userId === userId) {
+          return { slot, status: "selected", lockId: lock.lockId, expiresAt: lock.expiresAt };
         }
+        return { slot, status: "locked", expiresAt: lock.expiresAt };
+      }
 
-        return { slot, status: "available" };
-      })
-    );
+      cacheData[normalizedSlot] = { status: "available" };
+      return { slot, status: "available" };
+    });
+
+    // Store in cache
+    slotStatusCache.set(cacheKey, { timestamp: Date.now(), data: cacheData });
+
+    // Evict old cache entries periodically
+    if (slotStatusCache.size > 500) {
+      const cutoff = Date.now() - CACHE_TTL_MS * 4;
+      for (const [key, val] of slotStatusCache) {
+        if (val.timestamp < cutoff) slotStatusCache.delete(key);
+      }
+    }
 
     res.status(200).json({ slotStatuses });
   } catch (err) {
@@ -268,7 +309,11 @@ router.patch("/slots/confirm/:lockId", checkUserAuth, rejectGuest, async (req, r
 // ============================================
 // 5. CLEANUP EXPIRED LOCKS (can be called by cron/Cloud Function)
 // ============================================
-router.post("/slots/cleanup", async (req, res) => {
+router.post("/slots/cleanup", checkUserAuth, async (req, res) => {
+  // Only allow admin role
+  if (!req.user || req.user.role !== "admin") {
+    return res.status(403).json({ message: "Admin access required" });
+  }
   try {
     const now = new Date();
     const expiredLocksSnapshot = await db
