@@ -11,7 +11,10 @@ module.exports = function (req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.vendor = decoded; // { vendorId: ..., email: ... } — depends on your payload
+    if (decoded.role !== "vendor") {
+      return res.status(403).json({ message: "Vendor access required" });
+    }
+    req.vendor = decoded;
     next();
   } catch (err) {
     return res.status(401).json({ message: "Invalid or expired token" });

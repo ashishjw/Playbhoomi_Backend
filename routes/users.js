@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require("uuid");
 const haversine = require("haversine-distance");
 const checkUserAuth = require("../middleware/checkUserAuth");
 const { rejectGuest } = require("../middleware/checkUserAuth");
+const { checkAdminAuth } = require("../middleware/auth");
 const PDFDocument = require("pdfkit");
 const stream = require("stream-buffers");
 const { createNotification, sendBookingConfirmedNotification, sendPaymentSuccessNotification } = require("../utils/notificationHelper");
@@ -181,7 +182,7 @@ const computeBookingSummary = async ({
   const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
   const taxAmount = Math.round((baseAmount * taxRate) / 100);
   const settingsData = settingsSnap.exists ? settingsSnap.data() : {};
-  const convenienceFee = settingsData.convenienceFee ?? 35;
+  const convenienceFee = (settingsData.convenienceFee ?? 35) * totalSlots;
   const discountRate = settingsData.discountRate ?? 10;
   const subtotal = baseAmount + taxAmount + convenienceFee;
   const discountAmount = Math.round((subtotal * discountRate) / 100);
@@ -207,33 +208,7 @@ const computeBookingSummary = async ({
   };
 };
 
-// ✅ POST /users/refresh-token → Refresh JWT token using Firebase ID token
-router.post("/users/refresh-token", async (req, res) => {
-  try {
-    const { idToken } = req.body;
-    
-    if (!idToken) {
-      return res.status(400).json({ message: "idToken is required" });
-    }
-
-    // Verify the Firebase ID token
-    const decoded = await auth.verifyIdToken(idToken);
-    const { uid } = decoded;
-
-    // Generate a new JWT token
-    const token = generateToken(uid);
-    
-    return res.status(200).json({ 
-      message: "Token refreshed successfully", 
-      token 
-    });
-  } catch (err) {
-    console.error("Token refresh error:", err);
-    return res.status(401).json({ 
-      message: "Invalid or expired Firebase token" 
-    });
-  }
-});
+// Duplicate /users/refresh-token removed — handled by the route defined at L92 above
 
 // ✅ GET /users/profile → Get user profile
 router.get("/users/profile", checkUserAuth, async (req, res) => {
@@ -426,6 +401,7 @@ router.post("/users/nearby-venues", async (req, res) => {
         const turfs = [];
         turfsSnapshot.forEach((turfDoc) => {
           const turfData = turfDoc.data();
+          if (turfData.deleted) return;
           if (!turfData.vendorCoordinates) return;
 
           const dist = getDistance(
@@ -467,20 +443,8 @@ router.post("/users/nearby-venues", async (req, res) => {
   }
 });
 
-const getDistanceFromLatLonInKm = (lat1, lon1, lat2, lon2) => {
-  const R = 6371; // Earth's radius in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-};
+// Alias removed — use getDistance() defined above
+const getDistanceFromLatLonInKm = getDistance;
 
 router.post("/users/search-turfs", async (req, res) => {
   const { keyword, latitude, longitude } = req.body;
@@ -508,6 +472,7 @@ router.post("/users/search-turfs", async (req, res) => {
         const turfs = [];
         turfsSnapshot.forEach((turfDoc) => {
           const turf = turfDoc.data();
+          if (turf.deleted) return;
 
           const matchesTitle = turf.title?.toLowerCase().includes(lowerKeyword);
           const matchesSport =
@@ -681,6 +646,7 @@ router.get("/users/turfs/:turfId", async (req, res) => {
 
       if (turfDoc.exists) {
         const turfData = turfDoc.data();
+        if (turfData.deleted) continue;
         const vendorData = vendorDoc.data();
 
         return res.status(200).json({
@@ -788,6 +754,7 @@ router.post("/bookings/available-slots", checkUserAuth, async (req, res) => {
     const allSlots = turfData.timeSlots || [];
 
     // ✅ Step 3: Fetch bookings for the given date & sports
+    // Filter bookingStatus in-memory to avoid requiring a composite Firestore index
     const bookingsSnapshot = await db
       .collection("bookings")
       .where("vendorId", "==", vendorId)
@@ -798,7 +765,8 @@ router.post("/bookings/available-slots", checkUserAuth, async (req, res) => {
 
     const bookedSlots = new Set();
     bookingsSnapshot.forEach((doc) => {
-      bookedSlots.add(doc.data().timeSlot);
+      const b = doc.data();
+      if (b.bookingStatus === "confirmed") bookedSlots.add(b.timeSlot);
     });
 
     // ✅ Step 4: Filter available slots
@@ -1199,7 +1167,7 @@ router.post("/bookings/summary", checkUserAuth, async (req, res) => {
 
 router.get("/bookings/summary", checkUserAuth, async (req, res) => {
   try {
-    const { vendorId, turfId, sports, selectedSlots } = req.query;
+    const { vendorId, turfId, sports, selectedSlots, date } = req.query;
 
     if (!vendorId || !turfId || !sports || !selectedSlots) {
       return res.status(400).json({ message: "Missing required query params" });
@@ -1211,45 +1179,26 @@ router.get("/bookings/summary", checkUserAuth, async (req, res) => {
       return res.status(400).json({ message: "Selected slots are empty" });
     }
 
-    // Fetch turf info
-    const turfRef = db
+    const summary = await computeBookingSummary({
+      vendorId,
+      turfId,
+      sports,
+      selectedSlots: slotArray,
+      date,
+    });
+
+    // Fetch turfImages separately since computeBookingSummary doesn't return them
+    const turfDoc = await db
       .collection("vendors")
       .doc(vendorId)
       .collection("turfs")
-      .doc(turfId);
-    const turfDoc = await turfRef.get();
-
-    if (!turfDoc.exists) {
-      return res.status(404).json({ message: "Turf not found" });
-    }
-
-    const turfData = turfDoc.data();
-
-    // Find price for selected sport
-    const selectedSportData = turfData.sports.find(
-      (s) => s.name.toLowerCase() === sports.toLowerCase()
-    );
-
-    if (!selectedSportData) {
-      return res
-        .status(400)
-        .json({ message: "Selected sport not available on this turf" });
-    }
-
-    const pricePerSlot = selectedSportData.slotPrice;
-    const totalSlots = slotArray.length;
-    const totalAmount = pricePerSlot * totalSlots;
+      .doc(turfId)
+      .get();
 
     res.status(200).json({
-      turfId,
-      turfTitle: turfData.title,
-      turfLocation: turfData.address,
-      turfImages: turfData.images || [],
-      selectedSport: sports,
-      selectedSlots: slotArray,
-      pricePerSlot,
-      totalSlots,
-      totalAmount,
+      ...summary,
+      turfLocation: summary.location,
+      turfImages: turfDoc.exists ? (turfDoc.data().images || []) : [],
       message: "Booking summary generated",
     });
   } catch (err) {
@@ -1996,7 +1945,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
 
 // routes/users.js or routes/bookings.js
 
-router.get("/bookings/:id/summary-pdf", async (req, res) => {
+router.get("/bookings/:id/summary-pdf", checkUserAuth, async (req, res) => {
   const bookingId = req.params.id;
 
   try {
@@ -2007,6 +1956,11 @@ router.get("/bookings/:id/summary-pdf", async (req, res) => {
     }
 
     const booking = bookingDoc.data();
+
+    // Ownership check — only the booking owner can download their PDF
+    if (booking.userId !== req.user.uid) {
+      return res.status(403).json({ message: "Access denied" });
+    }
 
     // 2. Extract fields
     const {
@@ -2168,18 +2122,29 @@ router.get("/users/my-bookings", checkUserAuth, async (req, res) => {
 router.post("/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
   try {
     const { bookingId } = req.body;
+    const userId = req.user.uid;
 
     if (!bookingId) {
       return res.status(400).json({ message: "Booking ID not provided" });
     }
 
-    const bookingSnap = await db.collection("bookings").doc(bookingId).get();
+    const bookingRef = db.collection("bookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
 
     if (!bookingSnap.exists) {
       return res.status(404).json({ message: "Booking not found" });
     }
 
     const booking = bookingSnap.data();
+
+    // Ownership check
+    if (booking.userId !== userId) {
+      return res.status(403).json({ message: "Unauthorized cancellation attempt" });
+    }
+
+    if (booking.bookingStatus === "cancelled") {
+      return res.status(400).json({ message: "Booking is already cancelled" });
+    }
 
     if (
       !booking?.date ||
@@ -2191,26 +2156,33 @@ router.post("/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
       return res.status(400).json({ message: "Incomplete booking data" });
     }
 
-    // Parse slot time (e.g., "09:00 - 10:00" -> 09)
+    // Use server time — never trust client time for refund eligibility
     const slotStartHour = parseInt(booking.timeSlot.split(":")[0]);
-    const bookingDate = new Date(booking.date);
+    const slotStartMin = parseInt(booking.timeSlot.split(":")[1]) || 0;
+    const slotDateTime = new Date(booking.date);
+    slotDateTime.setHours(slotStartHour, slotStartMin, 0, 0);
     const now = new Date();
 
-    const slotDateTime = new Date(bookingDate);
-    slotDateTime.setHours(slotStartHour);
-    slotDateTime.setMinutes(0);
-    slotDateTime.setSeconds(0);
+    const timeDiffMinutes = (slotDateTime.getTime() - now.getTime()) / (1000 * 60);
 
-    const timeDiffMinutes =
-      (slotDateTime.getTime() - now.getTime()) / (1000 * 60);
-    const refundEligible = timeDiffMinutes > 60;
+    // Fetch cancellation policy from correct Firestore path
+    const turfSnap = await db
+      .collection("vendors")
+      .doc(booking.vendorId)
+      .collection("turfs")
+      .doc(booking.turfId)
+      .get();
+    const cancellationHours = turfSnap.exists ? (turfSnap.data().cancellationHours ?? 1) : 1;
+    const refundEligible = timeDiffMinutes > cancellationHours * 60;
 
-    // ✅ Step 1: Mark booking as cancelled
-    await db.collection("bookings").doc(bookingId).update({
+    // Step 1: Mark booking as cancelled
+    await bookingRef.update({
       bookingStatus: "cancelled",
+      cancelledAt: new Date().toISOString(),
+      refundStatus: refundEligible ? "pending" : "not_eligible",
     });
 
-    // ✅ Step 2: Update slotStatus structure (with merge)
+    // Step 2: Free the slot in correct Firestore path
     const slotStatusRef = db
       .collection("vendors")
       .doc(booking.vendorId)
@@ -2232,12 +2204,33 @@ router.post("/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
       { merge: true }
     );
 
+    // Step 3: Process actual Razorpay refund if eligible
+    let refundResult = null;
+    if (refundEligible && booking.paymentId && isRazorpayConfigured()) {
+      try {
+        const refundAmountPaise = Math.round((booking.amount || booking.finalAmount || 0) * 100);
+        if (refundAmountPaise > 0) {
+          const refund = await razorpay.payments.refund(booking.paymentId, {
+            amount: refundAmountPaise,
+            notes: { reason: "User cancelled booking", bookingId },
+          });
+          refundResult = { refunded: true, refundId: refund.id };
+          await bookingRef.update({ refundStatus: "refunded", refundId: refund.id });
+        }
+      } catch (refundErr) {
+        console.error("Razorpay refund error:", refundErr.message);
+        // Don't fail the cancellation if refund fails — log and retry manually
+        await bookingRef.update({ refundStatus: "refund_failed", refundError: refundErr.message });
+      }
+    }
+
     return res.status(200).json({
       message: "Booking cancelled successfully",
       refundEligible,
+      refundResult,
       refundInfo: refundEligible
-        ? "Refund will be processed (cancellation >1hr before slot)"
-        : "Refund not eligible (within 1hr of slot)",
+        ? "Refund has been initiated and will appear in 5-7 business days"
+        : `No refund — cancellation must be at least ${cancellationHours} hour(s) before slot`,
     });
   } catch (err) {
     console.error("Error cancelling booking:", err);
@@ -2300,7 +2293,7 @@ router.put("/users/profile", checkUserAuth, async (req, res) => {
 });
 
 
-router.post("/notifications/reminders", async (req, res) => {
+router.post("/notifications/reminders", checkAdminAuth, async (req, res) => {
   try {
     const now = new Date();
     const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
@@ -2356,110 +2349,8 @@ function isSlotWithin2Hours(timeSlot, targetTime) {
   return diff > -60000 && diff < 15 * 60 * 1000; // Allow 15 min window for trigger
 }
 
-function parseHour(timeStr) {
-  return parseInt(timeStr.split(":")[0], 10); // "23:00" → 23
-}
 
-router.post("/bookings/cancel-booking", checkUserAuth, rejectGuest, async (req, res) => {
-  const { bookingId, currentTime } = req.body;
-  const userId = req.user.uid;
-
-  if (!bookingId || !currentTime) {
-    return res
-      .status(400)
-      .json({ message: "Missing bookingId or currentTime" });
-  }
-
-  try {
-    // 1. Fetch booking
-    const bookingRef = db.collection("bookings").doc(bookingId);
-    const bookingSnap = await bookingRef.get();
-
-    if (!bookingSnap.exists) {
-      return res.status(404).json({ message: "Booking not found" });
-    }
-
-    const booking = bookingSnap.data();
-    console.log("Fetched Booking:", booking);
-    if (booking.userId !== userId) {
-      return res
-        .status(403)
-        .json({ message: "Unauthorized cancellation attempt" });
-    }
-
-    if (!booking.timeSlot || !booking.turfId || !booking.date) {
-      return res.status(400).json({
-        message: "Incomplete booking data",
-        missingFields: {
-          timeSlot: booking.timeSlot,
-          turfId: booking.turfId,
-          slotDate: booking.date,
-        },
-      });
-    }
-
-    // 2. Fetch cancellation hours from turf
-    const turfSnap = await db.collection("turfs").doc(booking.turfId).get();
-    const cancellationHours = turfSnap.exists
-      ? turfSnap.data().cancellationHours || 0
-      : 0;
-
-    // 3. Time diff calculation
-    const [slotStartTime] = booking.timeSlot.split(" - ");
-    const slotHour = parseHour(slotStartTime);
-    const currentHour = parseHour(currentTime);
-
-    let hourDiff = slotHour - currentHour;
-    if (hourDiff < 0) hourDiff += 24;
-
-    const refundEligible = hourDiff >= cancellationHours;
-
-    // 4. Update booking
-    await bookingRef.update({
-      bookingStatus: "cancelled",
-      refundStatus: refundEligible ? "eligible" : "not eligible",
-    });
-
-    // 5. Update slotStatus document
-    const slotStatusRef = db
-      .collection("turfs")
-      .doc(booking.turfId)
-      .collection("slotStatus")
-      .doc(booking.date);
-
-    const slotStatusSnap = await slotStatusRef.get();
-
-    if (slotStatusSnap.exists) {
-      const timeSlotMap = slotStatusSnap.data().football || {};
-
-      if (timeSlotMap[booking.timeSlot]) {
-        timeSlotMap[booking.timeSlot] = {
-          ...timeSlotMap[booking.timeSlot],
-          booked: false,
-          bookingId: null,
-          userId: null,
-        };
-
-        await slotStatusRef.update({ football: timeSlotMap });
-      }
-    }
-
-    return res.status(200).json({
-      message: "Booking cancelled successfully",
-      refundEligible,
-      refundInfo: refundEligible
-        ? `Refund will be processed as cancellation is ${hourDiff} hrs before the slot.`
-        : cancellationHours === 0
-        ? "No refund policy applies for this turf."
-        : `No refund. Cancellation happened only ${hourDiff} hrs before the slot (requires ${cancellationHours}+ hrs).`,
-    });
-  } catch (error) {
-    console.error("Cancel booking error:", error);
-    return res
-      .status(500)
-      .json({ message: "Internal Server Error", error: error.message });
-  }
-});
+// Removed duplicate /bookings/cancel-booking route — use /cancel-booking above
 
 module.exports = router;
 

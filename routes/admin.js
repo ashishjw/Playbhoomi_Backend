@@ -822,6 +822,7 @@ router.get("/admin/turfs", checkAdminAuth, async (req, res) => {
 
       turfSnapshot.forEach((turfDoc) => {
         const turf = turfDoc.data();
+        if (turf.deleted) return;
 
         // Get open/close time from timeSlots
         const openTimes = turf.timeSlots?.map((slot) => slot.open) || [];
@@ -1146,7 +1147,7 @@ router.get("/admin/bookings/:bookingId", checkAdminAuth, async (req, res) => {
   }
 });
 
-router.get("/admin/bookings/summary", async (req, res) => {
+router.get("/admin/bookings/summary", checkAdminAuth, async (req, res) => {
   console.log("📥 Admin bookings summary route hit");
 
   try {
