@@ -18,10 +18,7 @@ router.post("/admin/login", async (req, res) => {
   }
 
   // Fetch admin document
-  const snapshot = await db
-    .collection("admin")
-    .where("email", "==", email)
-    .get();
+  const snapshot = await db.collection("admin").limit(1).get();
   if (snapshot.empty) {
     return res.status(404).json({ message: "Admin not found" });
   }
