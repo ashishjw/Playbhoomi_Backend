@@ -12,6 +12,9 @@ const slotLockingRoutes = require("./routes/slotLocking");
 
 const app = express();
 
+// Trust Render's reverse proxy so express-rate-limit reads the real client IP
+app.set('trust proxy', 1);
+
 // CORS — open for mobile apps (CORS is browser-only, doesn't affect native apps)
 app.use(cors());
 
