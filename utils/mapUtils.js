@@ -9,15 +9,72 @@ async function resolveShortUrl(url) {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
     });
-    // follow-redirects (axios's internal dependency) tracks the final URL
-    return (
+
+    const finalUrl =
       response.request?._redirectable?._currentUrl ||
       response.request?.res?.responseUrl ||
-      url
-    );
+      url;
+
+    // If resolved URL has coordinates, return it directly
+    if (extractLatLngFromUrl(finalUrl)) {
+      return finalUrl;
+    }
+
+    // Fallback: scan the HTML response body for coordinates
+    const html = typeof response.data === "string" ? response.data : "";
+    const coordsFromHtml = extractLatLngFromHtml(html);
+    if (coordsFromHtml) {
+      // Return a synthetic URL that extractLatLngFromUrl can parse
+      return `https://maps.google.com/?q=${coordsFromHtml.lat},${coordsFromHtml.lng}`;
+    }
+
+    return finalUrl;
   } catch (error) {
     throw new Error("Failed to resolve short URL: " + error.message);
   }
+}
+
+function extractLatLngFromHtml(html) {
+  if (!html) return null;
+
+  // Pattern: APP_INITIALIZATION_STATE or window.APP_OPTIONS containing [null,null,lat,lng]
+  const regexInitState = /\[null,null,([-+]?\d{1,3}\.\d{4,}),([-+]?\d{1,3}\.\d{4,})\]/;
+
+  // Pattern: /@lat,lng in any embedded URL within the HTML
+  const regexEmbeddedAt = /\/@([-+]?\d{1,3}\.\d{4,}),([-+]?\d{1,3}\.\d{4,})/;
+
+  // Pattern: Google Maps image/static map center=lat%2Clng or center=lat,lng
+  const regexCenter = /center=([-+]?\d{1,3}\.\d{4,})(?:%2C|,)([-+]?\d{1,3}\.\d{4,})/;
+
+  // Pattern: pb=...!2d<lng>!3d<lat> (note: 2d is lng, 3d is lat in this format)
+  const regexPb2d3d = /!2d([-+]?\d{1,3}\.\d{4,})!3d([-+]?\d{1,3}\.\d{4,})/;
+
+  let match;
+
+  // Prefer embedded @ pattern (most reliable)
+  if ((match = html.match(regexEmbeddedAt))) {
+    return { lat: parseFloat(match[1]), lng: parseFloat(match[2]) };
+  }
+
+  // pb format: !2d is longitude, !3d is latitude
+  if ((match = html.match(regexPb2d3d))) {
+    return { lat: parseFloat(match[2]), lng: parseFloat(match[1]) };
+  }
+
+  if ((match = html.match(regexInitState))) {
+    return { lat: parseFloat(match[1]), lng: parseFloat(match[2]) };
+  }
+
+  if ((match = html.match(regexCenter))) {
+    const lat = parseFloat(match[1]);
+    const lng = parseFloat(match[2]);
+    // Sanity check: valid lat/lng ranges
+    if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      return { lat, lng };
+    }
+  }
+
+  return null;
 }
 
 function extractLatLngFromUrl(url) {
