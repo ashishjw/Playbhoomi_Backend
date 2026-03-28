@@ -77,28 +77,31 @@ const generatePassword = () => Math.random().toString(36).slice(-8); // 8-char
 
 router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
   try {
-    const { name, phone, location, gpsUrl } = req.body;
+    const { name, phone, location, gpsUrl, latitude, longitude } = req.body;
 
-    if (!name || !phone || !location || !gpsUrl) {
-      return res.status(400).json({ message: "Missing required fields" });
+    if (!name || !phone || !location) {
+      return res.status(400).json({ message: "Missing required fields (name, phone, location)" });
     }
 
-    // 1) Resolve short URL (maps.app.goo.gl) if present; fall back to original on failure
-    let finalUrl = gpsUrl;
-    try {
-      finalUrl = await resolveShortUrl(gpsUrl); // returns same URL if already full
-    } catch (_) {
-      // ignore resolution errors; we'll try parsing the original url
+    // 1) Try direct lat/lng first (most reliable)
+    let coords = null;
+    if (latitude && longitude) {
+      coords = { lat: parseFloat(latitude), lng: parseFloat(longitude) };
     }
 
-    // 2) Extract lat/lng from the resolved URL; fallback to original if needed
-    const coords =
-      extractLatLngFromUrl(finalUrl) || extractLatLngFromUrl(gpsUrl);
+    // 2) Try extracting from GPS URL
+    if (!coords && gpsUrl) {
+      let finalUrl = gpsUrl;
+      try {
+        finalUrl = await resolveShortUrl(gpsUrl);
+      } catch (_) {}
+      coords = extractLatLngFromUrl(finalUrl) || extractLatLngFromUrl(gpsUrl);
+    }
 
     if (!coords) {
       return res.status(400).json({
         message:
-          "Could not extract coordinates from the provided GPS URL. Please share a valid Google Maps link.",
+          "Could not extract coordinates. Please provide latitude & longitude, or a Google Maps URL with @lat,lng in it.",
       });
     }
 
@@ -162,7 +165,7 @@ router.get("/admin/vendors", checkAdminAuth, async (req, res) => {
 router.put("/admin/vendors/:vendorId", checkAdminAuth, async (req, res) => {
   try {
     const { vendorId } = req.params;
-    const { name, phone, location, email, gpsUrl, password } = req.body;
+    const { name, phone, location, email, gpsUrl, password, latitude, longitude } = req.body;
 
     const vendorRef = db.collection("vendors").doc(vendorId);
     const doc = await vendorRef.get();
@@ -176,7 +179,6 @@ router.put("/admin/vendors/:vendorId", checkAdminAuth, async (req, res) => {
     if (phone) updateData.phone = phone;
     if (location) updateData.location = location;
     if (email) {
-      // Simple validation for email format
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailRegex.test(email)) {
         return res.status(400).json({ message: "Invalid email format" });
@@ -184,28 +186,27 @@ router.put("/admin/vendors/:vendorId", checkAdminAuth, async (req, res) => {
       updateData.email = email;
     }
     if (password) updateData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    if (gpsUrl) {
-      updateData.gpsUrl = gpsUrl;
 
-      // 1) Resolve short URL if needed
+    // Handle coordinates: prefer direct lat/lng, fallback to GPS URL parsing
+    let coords = null;
+    if (latitude && longitude) {
+      coords = { lat: parseFloat(latitude), lng: parseFloat(longitude) };
+    } else if (gpsUrl) {
+      updateData.gpsUrl = gpsUrl;
       let finalUrl = gpsUrl;
       try {
         finalUrl = await resolveShortUrl(gpsUrl);
-      } catch (_) {
-        console.log("Failed to resolve short URL, using original.");
-      }
-
-      // 2) Extract coordinates
-      const coords =
-        extractLatLngFromUrl(finalUrl) || extractLatLngFromUrl(gpsUrl);
-
+      } catch (_) {}
+      coords = extractLatLngFromUrl(finalUrl) || extractLatLngFromUrl(gpsUrl);
       if (!coords) {
         return res.status(400).json({
           message:
-            "Could not extract coordinates from the provided GPS URL. Please share a valid Google Maps link.",
+            "Could not extract coordinates. Please provide latitude & longitude, or a Google Maps URL with @lat,lng in it.",
         });
       }
+    }
 
+    if (coords) {
       updateData.coordinates = {
         lat: coords.lat,
         lng: coords.lng,
