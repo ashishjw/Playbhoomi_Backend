@@ -179,11 +179,11 @@ const computeBookingSummary = async ({
     db.collection("tax").doc("global").get(),
     db.collection("settings").doc("global").get(),
   ]);
-  const taxRate = taxSnap.exists ? taxSnap.data().percentage : 0;
+  const taxRate = Number(taxSnap.exists ? taxSnap.data().percentage : 0) || 0;
   const taxAmount = Math.round((baseAmount * taxRate) / 100);
   const settingsData = settingsSnap.exists ? settingsSnap.data() : {};
-  const convenienceFee = (settingsData.convenienceFee ?? 35) * totalSlots;
-  const discountRate = settingsData.discountRate ?? 10;
+  const convenienceFee = (Number(settingsData.convenienceFee) || 35) * totalSlots;
+  const discountRate = Number(settingsData.discountRate) || 10;
   const subtotal = baseAmount + taxAmount + convenienceFee;
   const discountAmount = Math.round((subtotal * discountRate) / 100);
   const finalAmount = subtotal - discountAmount;
