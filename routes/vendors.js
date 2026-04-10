@@ -9,21 +9,29 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const BCRYPT_ROUNDS = 10;
 
 router.post("/vendors/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, phone, password } = req.body;
+  const loginId = phone || email; // prefer phone, fallback to email
 
-  if (!email || !password) {
-    return res.status(400).json({ message: "Email and password required" });
+  if (!loginId || !password) {
+    return res.status(400).json({ message: "Phone/email and password required" });
   }
 
   try {
-    const vendorSnapshot = await db
-      .collection("vendors")
-      .where("email", "==", email)
-      .limit(1)
-      .get();
+    // Try phone first, then email
+    let vendorSnapshot;
+    if (phone) {
+      vendorSnapshot = await db.collection("vendors").where("phone", "==", phone).limit(1).get();
+    }
+    if ((!vendorSnapshot || vendorSnapshot.empty) && email) {
+      vendorSnapshot = await db.collection("vendors").where("email", "==", email).limit(1).get();
+    }
+    // Also try loginId as email if only one field sent
+    if ((!vendorSnapshot || vendorSnapshot.empty) && !phone) {
+      vendorSnapshot = await db.collection("vendors").where("phone", "==", loginId).limit(1).get();
+    }
 
-    if (vendorSnapshot.empty) {
-      return res.status(401).json({ message: "Invalid email or password" });
+    if (!vendorSnapshot || vendorSnapshot.empty) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const vendorDoc = vendorSnapshot.docs[0];
@@ -36,7 +44,7 @@ router.post("/vendors/login", async (req, res) => {
       : vendorData.password === password;
 
     if (!passwordMatch) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     // Auto-migrate plaintext password to bcrypt hash

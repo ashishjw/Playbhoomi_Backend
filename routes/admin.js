@@ -77,10 +77,16 @@ const generatePassword = () => Math.random().toString(36).slice(-8); // 8-char
 
 router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
   try {
-    const { name, phone, location, gpsUrl, latitude, longitude } = req.body;
+    const { name, phone, location, gpsUrl, latitude, longitude, password: adminPassword } = req.body;
 
     if (!name || !phone || !location) {
       return res.status(400).json({ message: "Missing required fields (name, phone, location)" });
+    }
+
+    // Check for duplicate phone number
+    const existingVendor = await db.collection("vendors").where("phone", "==", phone).limit(1).get();
+    if (!existingVendor.empty) {
+      return res.status(400).json({ message: "A vendor with this phone number already exists" });
     }
 
     // 1) Try direct lat/lng first (most reliable)
@@ -105,21 +111,18 @@ router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
       });
     }
 
-    // 3) Generate random email + password
-    const randomId = generateRandomId();
-    const email = `vendor_${randomId}@venuemgmt.com`;
-    const password = generatePassword();
+    // 3) Use admin-provided password or auto-generate
+    const password = adminPassword || generatePassword();
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    // 4) Save vendor document
-    const newVendorRef = db.collection("vendors").doc(); // auto ID
+    // 4) Save vendor document (phone is the login ID)
+    const newVendorRef = db.collection("vendors").doc();
     const vendorData = {
       name,
-      email,
       phone,
-      password: hashedPassword, // bcrypt hashed
+      password: hashedPassword,
       location,
-      gpsUrl, // store the URL the admin provided
+      gpsUrl,
       coordinates: {
         lat: coords.lat,
         lng: coords.lng,
@@ -133,7 +136,7 @@ router.post("/admin/vendors", checkAdminAuth, async (req, res) => {
     return res.status(201).json({
       message: "Vendor created successfully",
       vendorId: newVendorRef.id,
-      login: { email, password },
+      login: { phone, password: adminPassword ? "(set by admin)" : password },
       coordinates: vendorData.coordinates,
     });
   } catch (err) {
