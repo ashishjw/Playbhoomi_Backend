@@ -753,8 +753,12 @@ router.post("/bookings/available-slots", checkUserAuth, async (req, res) => {
 
     const allSlots = turfData.timeSlots || [];
 
+    // Determine court capacity (if configured)
+    const { getCourtsForSport } = require("../utils/courtHelper");
+    const allCourts = await getCourtsForSport(vendorId, turfId, sports);
+    const capacity = allCourts.length > 0 ? allCourts.length : 1;
+
     // ✅ Step 3: Fetch bookings for the given date & sports
-    // Filter bookingStatus in-memory to avoid requiring a composite Firestore index
     const bookingsSnapshot = await db
       .collection("bookings")
       .where("vendorId", "==", vendorId)
@@ -763,14 +767,19 @@ router.post("/bookings/available-slots", checkUserAuth, async (req, res) => {
       .where("sports", "==", sports)
       .get();
 
-    const bookedSlots = new Set();
+    // Count confirmed bookings per slot; slot is fully booked only when count >= capacity
+    const bookingsPerSlot = {};
     bookingsSnapshot.forEach((doc) => {
       const b = doc.data();
-      if (b.bookingStatus === "confirmed") bookedSlots.add(b.timeSlot);
+      if (b.bookingStatus === "confirmed") {
+        bookingsPerSlot[b.timeSlot] = (bookingsPerSlot[b.timeSlot] || 0) + 1;
+      }
     });
 
-    // ✅ Step 4: Filter available slots
-    const availableSlots = allSlots.filter((slot) => !bookedSlots.has(slot));
+    // ✅ Step 4: Filter out only fully-booked slots
+    const availableSlots = allSlots.filter(
+      (slot) => (bookingsPerSlot[slot] || 0) < capacity
+    );
 
     res.status(200).json({
       turfId,
@@ -1417,6 +1426,44 @@ router.post(
         ? vendorDoc.data()
         : { name: "Unknown Vendor" };
 
+      // Assign a court if configured (court-aware mode)
+      const { getCourtsForSport: _getCourts, pickAvailableCourt: _pickCourt } = require("../utils/courtHelper");
+      const _sportsNorm = (sports || "").trim().toLowerCase();
+      const _slotNorm = (timeSlot || "").trim();
+      const _allCourts = await _getCourts(vendorId, turfId, _sportsNorm);
+      let _assignedCourt = null;
+      if (_allCourts.length > 0) {
+        const [_bookingsForSlot, _locksForSlot] = await Promise.all([
+          db.collection("bookings")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sports", "==", _sportsNorm)
+            .where("date", "==", date)
+            .where("timeSlot", "==", _slotNorm)
+            .where("bookingStatus", "==", "confirmed")
+            .get(),
+          db.collection("slot_locks")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sport", "==", _sportsNorm)
+            .where("date", "==", date)
+            .where("timeSlot", "==", _slotNorm)
+            .where("status", "==", "locked")
+            .get(),
+        ]);
+        const _now = new Date();
+        const _taken = [
+          ..._bookingsForSlot.docs.map((d) => d.data().court).filter(Boolean),
+          ..._locksForSlot.docs
+            .filter((d) => {
+              const exp = d.data().expiresAt?.toDate?.() || new Date(d.data().expiresAt);
+              return exp > _now && d.data().userId !== userId;
+            })
+            .map((d) => d.data().court).filter(Boolean),
+        ];
+        _assignedCourt = _pickCourt(_allCourts, _taken).court;
+      }
+
       // ✅ 1. Save to Firestore `bookings`
       const bookingData = {
         orderId,
@@ -1431,6 +1478,7 @@ router.post(
         date,
         timeSlot,
         sports,
+        court: _assignedCourt,
         amount,
         paymentStatus: "confirmed",
         bookingStatus: "confirmed",
@@ -1691,6 +1739,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
     const now = new Date();
     const selectedSlotSet = new Set(normalizedSlots);
     const lockToSlotMap = new Map();
+    const slotToCourtMap = new Map(); // tracks assigned court per slot (from lock)
 
     for (const lockId of userLockIds) {
       const lockRef = db.collection("slot_locks").doc(lockId);
@@ -1756,12 +1805,54 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       }
 
       lockToSlotMap.set(slot, lockRef);
+      if (lockData.court) {
+        slotToCourtMap.set(slot, lockData.court);
+      }
     }
 
     // Fill in any slots whose locks were cleaned up (payment already verified above)
     for (const slot of normalizedSlots) {
       if (!lockToSlotMap.has(slot)) {
         lockToSlotMap.set(slot, null); // null = lock expired, slot booking proceeds via payment trust
+      }
+    }
+
+    // For slots without assigned court (lock expired), assign one now if courts are configured
+    const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
+    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+    if (allCourts.length > 0) {
+      for (const slot of normalizedSlots) {
+        if (slotToCourtMap.has(slot)) continue;
+        // Fetch existing courts taken for this slot
+        const [bookingsForSlot, locksForSlot] = await Promise.all([
+          db.collection("bookings")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sports", "==", normalizedSport)
+            .where("date", "==", date)
+            .where("timeSlot", "==", slot)
+            .where("bookingStatus", "==", "confirmed")
+            .get(),
+          db.collection("slot_locks")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sport", "==", normalizedSport)
+            .where("date", "==", date)
+            .where("timeSlot", "==", slot)
+            .where("status", "==", "locked")
+            .get(),
+        ]);
+        const takenCourts = [
+          ...bookingsForSlot.docs.map((d) => d.data().court).filter(Boolean),
+          ...locksForSlot.docs
+            .filter((d) => {
+              const exp = d.data().expiresAt?.toDate?.() || new Date(d.data().expiresAt);
+              return exp > now && d.data().userId !== userId;
+            })
+            .map((d) => d.data().court).filter(Boolean),
+        ];
+        const { court } = pickAvailableCourt(allCourts, takenCourts);
+        if (court) slotToCourtMap.set(slot, court);
       }
     }
 
@@ -1808,6 +1899,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           date,
           timeSlot: slot,
           sports: normalizedSport,
+          court: slotToCourtMap.get(slot) || null,
           amount: expectedSummary.pricePerSlot,
           finalAmount: expectedSummary.finalAmount,
           paymentStatus: "confirmed",

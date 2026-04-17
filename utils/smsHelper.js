@@ -25,7 +25,7 @@ async function sendSMS(phone, message) {
 
 async function sendBookingConfirmationSMS(phone, { bookingId, turfName, date, timeSlot, amount }) {
   const message =
-    `Booking Confirmed! Krida\n` +
+    `Booking Confirmed! Playbhoomi\n` +
     `Venue: ${turfName}\n` +
     `Date: ${date} at ${timeSlot}\n` +
     `Amount: Rs.${amount}\n` +
@@ -39,7 +39,7 @@ async function sendBookingConfirmationSMS(phone, { bookingId, turfName, date, ti
 
 async function sendBookingReminderSMS(phone, { turfName, date, timeSlot }) {
   const message =
-    `Reminder: Your Krida booking is in ~2 hours!\n` +
+    `Reminder: Your Playbhoomi booking is in ~2 hours!\n` +
     `Venue: ${turfName}\n` +
     `Date: ${date} at ${timeSlot}`;
   try {

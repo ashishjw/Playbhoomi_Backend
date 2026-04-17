@@ -4,13 +4,11 @@ const { db } = require("../firebase/firebase");
 const { v4: uuidv4 } = require("uuid");
 const checkUserAuth = require("../middleware/checkUserAuth");
 const { rejectGuest } = require("../middleware/checkUserAuth");
+const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
 
 // Lock expiration time in minutes
 const LOCK_EXPIRATION_MINUTES = 10;
 
-// In-memory cache for slot status (reduces Firestore reads)
-const slotStatusCache = new Map();
-const CACHE_TTL_MS = 15000; // 15 seconds
 
 // ============================================
 // 1. LOCK A SLOT (when user selects it)
@@ -26,80 +24,115 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
 
     const normalizedSport = sport.trim().toLowerCase();
     const normalizedSlot = timeSlot.trim();
-
-    // Check if already booked
-    const bookingSnapshot = await db
-      .collection("bookings")
-      .where("vendorId", "==", vendorId)
-      .where("turfId", "==", turfId)
-      .where("sports", "==", normalizedSport)
-      .where("date", "==", date)
-      .where("timeSlot", "==", normalizedSlot)
-      .where("bookingStatus", "==", "confirmed")
-      .limit(1)
-      .get();
-
-    if (!bookingSnapshot.empty) {
-      return res.status(409).json({
-        status: "booked",
-        message: "Slot already booked",
-      });
-    }
-
-    // Check if locked by someone else
     const now = new Date();
-    const lockSnapshot = await db
-      .collection("slot_locks")
-      .where("vendorId", "==", vendorId)
-      .where("turfId", "==", turfId)
-      .where("sport", "==", normalizedSport)
-      .where("date", "==", date)
-      .where("timeSlot", "==", normalizedSlot)
-      .where("status", "==", "locked")
-      .get();
 
-    // Filter active locks (not expired)
+    // Fetch courts configured for this sport
+    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+
+    // Fetch existing bookings and locks for this slot
+    const [bookingSnapshot, lockSnapshot] = await Promise.all([
+      db.collection("bookings")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sports", "==", normalizedSport)
+        .where("date", "==", date)
+        .where("timeSlot", "==", normalizedSlot)
+        .where("bookingStatus", "==", "confirmed")
+        .get(),
+      db.collection("slot_locks")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sport", "==", normalizedSport)
+        .where("date", "==", date)
+        .where("timeSlot", "==", normalizedSlot)
+        .where("status", "==", "locked")
+        .get(),
+    ]);
+
+    // Active (non-expired) locks
     const activeLocks = lockSnapshot.docs.filter((doc) => {
       const lockData = doc.data();
       const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
       return expiresAt > now;
     });
 
-    if (activeLocks.length > 0) {
-      const existingLock = activeLocks[0].data();
-      if (existingLock.userId !== userId) {
+    // If user already has a lock on this slot, extend it
+    const existingUserLock = activeLocks.find((d) => d.data().userId === userId);
+    if (existingUserLock) {
+      const lockId = existingUserLock.id;
+      const newExpiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
+      await db.collection("slot_locks").doc(lockId).update({
+        expiresAt: newExpiresAt,
+        lockedAt: now,
+      });
+      return res.status(200).json({
+        status: "success",
+        lockId,
+        expiresAt: newExpiresAt,
+        court: existingUserLock.data().court || null,
+        message: "Lock extended for 10 minutes",
+      });
+    }
+
+    // Legacy path: no courts configured → treat as single capacity
+    if (allCourts.length === 0) {
+      if (bookingSnapshot.size > 0) {
+        return res.status(409).json({ status: "booked", message: "Slot already booked" });
+      }
+      if (activeLocks.length > 0) {
+        const existingLock = activeLocks[0].data();
         const expiresAt = existingLock.expiresAt?.toDate?.() || new Date(existingLock.expiresAt);
         return res.status(409).json({
           status: "locked",
           message: "Slot is being booked by another user",
           expiresIn: Math.ceil((expiresAt - now) / 1000),
         });
-      } else {
-        // User already has a lock on this slot, extend it
-        const lockId = activeLocks[0].id;
-        const newExpiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
+      }
+    } else {
+      // Court-aware path: figure out which courts are taken
+      const takenCourts = [
+        ...bookingSnapshot.docs.map((d) => d.data().court).filter(Boolean),
+        ...activeLocks.map((d) => d.data().court).filter(Boolean),
+      ];
+      const { court: availableCourt, availableCount } = pickAvailableCourt(allCourts, takenCourts);
 
-        await db.collection("slot_locks").doc(lockId).update({
-          expiresAt: newExpiresAt,
-          lockedAt: now,
-        });
-
-        return res.status(200).json({
-          status: "success",
-          lockId,
-          expiresAt: newExpiresAt,
-          message: "Lock extended for 10 minutes",
+      if (availableCount === 0 || !availableCourt) {
+        return res.status(409).json({
+          status: "booked",
+          message: "All courts are booked for this slot",
         });
       }
+
+      // Create new lock with the assigned court
+      const lockId = uuidv4();
+      const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
+
+      await db.collection("slot_locks").doc(lockId).set({
+        lockId,
+        vendorId,
+        turfId,
+        sport: normalizedSport,
+        date,
+        timeSlot: normalizedSlot,
+        userId,
+        court: availableCourt,
+        lockedAt: now,
+        expiresAt,
+        status: "locked",
+      });
+
+      return res.status(200).json({
+        status: "success",
+        lockId,
+        expiresAt,
+        court: availableCourt,
+        message: "Slot locked for 10 minutes",
+      });
     }
 
-    // Create new lock — invalidate cache for this turf+date
-    const lockCacheKey = `${vendorId}:${turfId}:${normalizedSport}:${date}`;
-    slotStatusCache.delete(lockCacheKey);
-
+    // Fallback (no courts, no bookings, no locks) — create a plain lock
     const lockId = uuidv4();
     const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
-
     await db.collection("slot_locks").doc(lockId).set({
       lockId,
       vendorId,
@@ -108,6 +141,7 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
       date,
       timeSlot: normalizedSlot,
       userId,
+      court: null,
       lockedAt: now,
       expiresAt,
       status: "locked",
@@ -117,6 +151,7 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
       status: "success",
       lockId,
       expiresAt,
+      court: null,
       message: "Slot locked for 10 minutes",
     });
   } catch (err) {
@@ -148,11 +183,6 @@ router.delete("/slots/unlock/:lockId", checkUserAuth, rejectGuest, async (req, r
       return res.status(409).json({ message: "Only active locks can be released" });
     }
 
-    // Invalidate cache for this slot's turf+date
-    const lockData = lockDoc.data();
-    const unlockCacheKey = `${lockData.vendorId}:${lockData.turfId}:${lockData.sport}:${lockData.date}`;
-    slotStatusCache.delete(unlockCacheKey);
-
     await lockRef.delete();
     res.status(200).json({ message: "Lock released" });
   } catch (err) {
@@ -176,27 +206,12 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
 
     const normalizedSport = sport.trim().toLowerCase();
 
-    // Build a cache key for this turf+sport+date combo
-    const cacheKey = `${vendorId}:${turfId}:${normalizedSport}:${date}`;
-    const cached = slotStatusCache.get(cacheKey);
+    // Fetch courts configured for this sport (capacity)
+    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+    // If no courts configured, treat each slot as capacity 1 (legacy behavior)
+    const totalCapacity = allCourts.length > 0 ? allCourts.length : 1;
 
-    // Use cache if fresh (< 15 seconds old)
-    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
-      // Personalize per user (own locks show as "selected")
-      const slotStatuses = timeSlots.map((slot) => {
-        const normalizedSlot = slot.trim();
-        const cachedSlot = cached.data[normalizedSlot];
-        if (!cachedSlot) return { slot, status: "available" };
-
-        if (cachedSlot.status === "locked" && cachedSlot.userId === userId) {
-          return { slot, status: "selected", lockId: cachedSlot.lockId, expiresAt: cachedSlot.expiresAt };
-        }
-        return { slot, status: cachedSlot.status, ...(cachedSlot.expiresAt && { expiresAt: cachedSlot.expiresAt }) };
-      });
-      return res.status(200).json({ slotStatuses });
-    }
-
-    // Batch queries: one for bookings, one for locks (instead of per-slot)
+    // Batch queries: bookings + locks for the day
     const [bookedSnapshot, lockSnapshot] = await Promise.all([
       db.collection("bookings")
         .where("vendorId", "==", vendorId)
@@ -214,59 +229,53 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
         .get(),
     ]);
 
-    // Index booked slots
-    const bookedSlots = new Set();
+    // Count bookings per slot (count of confirmed reservations)
+    const bookingsPerSlot = {};
     bookedSnapshot.docs.forEach((doc) => {
-      bookedSlots.add(doc.data().timeSlot);
+      const slot = doc.data().timeSlot;
+      bookingsPerSlot[slot] = (bookingsPerSlot[slot] || 0) + 1;
     });
 
-    // Index active locks by slot
-    const locksBySlot = {};
+    // Index active locks per slot (and which user holds them)
+    const locksPerSlot = {};
     lockSnapshot.docs.forEach((doc) => {
       const lockData = doc.data();
       const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
-      if (expiresAt > now) {
-        locksBySlot[lockData.timeSlot] = {
-          userId: lockData.userId,
-          lockId: lockData.lockId,
-          expiresAt,
-        };
-      }
+      if (expiresAt <= now) return;
+      if (!locksPerSlot[lockData.timeSlot]) locksPerSlot[lockData.timeSlot] = [];
+      locksPerSlot[lockData.timeSlot].push({
+        userId: lockData.userId,
+        lockId: lockData.lockId,
+        expiresAt,
+      });
     });
 
-    // Build cache entry and response
-    const cacheData = {};
+    // Build response: slot is "booked" only when all courts are taken
     const slotStatuses = timeSlots.map((slot) => {
       const normalizedSlot = slot.trim();
+      const bookedCount = bookingsPerSlot[normalizedSlot] || 0;
+      const activeLocks = locksPerSlot[normalizedSlot] || [];
+      const takenCount = bookedCount + activeLocks.length;
 
-      if (bookedSlots.has(normalizedSlot)) {
-        cacheData[normalizedSlot] = { status: "booked" };
+      // Full capacity taken → booked
+      if (takenCount >= totalCapacity) {
+        // Prefer showing "selected" if one of the locks is the current user's
+        const myLock = activeLocks.find((l) => l.userId === userId);
+        if (myLock) {
+          return { slot, status: "selected", lockId: myLock.lockId, expiresAt: myLock.expiresAt };
+        }
         return { slot, status: "booked" };
       }
 
-      const lock = locksBySlot[normalizedSlot];
-      if (lock) {
-        cacheData[normalizedSlot] = { status: "locked", userId: lock.userId, lockId: lock.lockId, expiresAt: lock.expiresAt };
-        if (lock.userId === userId) {
-          return { slot, status: "selected", lockId: lock.lockId, expiresAt: lock.expiresAt };
-        }
-        return { slot, status: "locked", expiresAt: lock.expiresAt };
+      // Not full — if current user has a lock here, show selected
+      const myLock = activeLocks.find((l) => l.userId === userId);
+      if (myLock) {
+        return { slot, status: "selected", lockId: myLock.lockId, expiresAt: myLock.expiresAt };
       }
 
-      cacheData[normalizedSlot] = { status: "available" };
+      // Capacity still available
       return { slot, status: "available" };
     });
-
-    // Store in cache
-    slotStatusCache.set(cacheKey, { timestamp: Date.now(), data: cacheData });
-
-    // Evict old cache entries periodically
-    if (slotStatusCache.size > 500) {
-      const cutoff = Date.now() - CACHE_TTL_MS * 4;
-      for (const [key, val] of slotStatusCache) {
-        if (val.timestamp < cutoff) slotStatusCache.delete(key);
-      }
-    }
 
     res.status(200).json({ slotStatuses });
   } catch (err) {
