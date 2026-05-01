@@ -5,8 +5,17 @@ const BREVO_URL = "https://api.brevo.com/v3/smtp/email";
 async function sendEmail(to, subject, htmlContent) {
   if (!to || !to.includes("@")) {
     console.warn("[Email] Invalid email address:", to);
-    return;
+    return null;
   }
+
+  if (!process.env.BREVO_API_KEY) {
+    throw new Error("BREVO_API_KEY is not configured");
+  }
+
+  if (!process.env.BREVO_SENDER_EMAIL) {
+    throw new Error("BREVO_SENDER_EMAIL is not configured");
+  }
+
   const response = await axios.post(
     BREVO_URL,
     {
@@ -18,15 +27,28 @@ async function sendEmail(to, subject, htmlContent) {
       subject,
       htmlContent,
     },
-    { headers: { "api-key": process.env.BREVO_API_KEY, "Content-Type": "application/json" } }
+    {
+      headers: {
+        "api-key": process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+      },
+    }
   );
-  if (response.status >= 400) {
-    throw new Error(`Brevo error: ${JSON.stringify(response.data)}`);
-  }
+
+  return response.data;
+}
+
+function logEmailFailure(label, email, err) {
+  console.error(`[Email] ${label} failed:`, {
+    message: err.message,
+    status: err.response?.status,
+    data: err.response?.data,
+    to: email,
+  });
 }
 
 async function sendBookingConfirmationEmail(email, { bookingId, turfName, date, timeSlot, amount }) {
-  const subject = "Booking Confirmed – Playbhoomi";
+  const subject = "Booking Confirmed - Playbhoomi";
   const htmlContent = `
     <div style="font-family:sans-serif;max-width:500px;margin:auto;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
       <div style="background:#067B6A;padding:20px;text-align:center">
@@ -41,13 +63,18 @@ async function sendBookingConfirmationEmail(email, { bookingId, turfName, date, 
           <tr><td style="padding:8px 0;color:#555">Amount Paid</td><td style="padding:8px 0;font-weight:600">Rs. ${amount}</td></tr>
           <tr><td style="padding:8px 0;color:#555">Booking ID</td><td style="padding:8px 0;font-size:12px;color:#888">${bookingId}</td></tr>
         </table>
-        <p style="margin:20px 0 0;color:#888;font-size:12px">See you on the field! – Team Playbhoomi</p>
+        <p style="margin:20px 0 0;color:#888;font-size:12px">See you on the field! - Team Playbhoomi</p>
       </div>
     </div>`;
+
   try {
-    await sendEmail(email, subject, htmlContent);
+    const result = await sendEmail(email, subject, htmlContent);
+    console.log("[Email] Booking confirmation sent:", {
+      to: email,
+      messageId: result?.messageId || result?.messageIds?.[0] || null,
+    });
   } catch (err) {
-    console.error("[Email] Booking confirmation failed:", err.message);
+    logEmailFailure("Booking confirmation", email, err);
   }
 }
 
@@ -65,13 +92,18 @@ async function sendBookingReminderEmail(email, { turfName, date, timeSlot }) {
           <tr><td style="padding:8px 0;color:#555">Date</td><td style="padding:8px 0;font-weight:600">${date}</td></tr>
           <tr><td style="padding:8px 0;color:#555">Time Slot</td><td style="padding:8px 0;font-weight:600">${timeSlot}</td></tr>
         </table>
-        <p style="margin:20px 0 0;color:#888;font-size:12px">See you on the field! – Team Playbhoomi</p>
+        <p style="margin:20px 0 0;color:#888;font-size:12px">See you on the field! - Team Playbhoomi</p>
       </div>
     </div>`;
+
   try {
-    await sendEmail(email, subject, htmlContent);
+    const result = await sendEmail(email, subject, htmlContent);
+    console.log("[Email] Booking reminder sent:", {
+      to: email,
+      messageId: result?.messageId || result?.messageIds?.[0] || null,
+    });
   } catch (err) {
-    console.error("[Email] Booking reminder failed:", err.message);
+    logEmailFailure("Booking reminder", email, err);
   }
 }
 

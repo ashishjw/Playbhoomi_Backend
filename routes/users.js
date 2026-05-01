@@ -1718,26 +1718,17 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       .map((lock) => lock?.lockId)
       .filter((id) => typeof id === "string" && id.trim());
 
-    // Pre-transaction: check for duplicate bookings (queries not allowed inside transactions)
-    for (const slot of normalizedSlots) {
-      const existingBookingSnapshot = await db
-        .collection("bookings")
-        .where("vendorId", "==", vendorId)
-        .where("turfId", "==", turfId)
-        .where("sports", "==", normalizedSport)
-        .where("date", "==", date)
-        .where("timeSlot", "==", slot)
-        .where("bookingStatus", "==", "confirmed")
-        .limit(1)
-        .get();
-      if (!existingBookingSnapshot.empty) {
-        throw new Error(`Slot already booked: ${slot}`);
-      }
+    const selectedSlotSet = new Set(normalizedSlots);
+    if (selectedSlotSet.size !== normalizedSlots.length) {
+      throw new Error("Duplicate selected slots are not supported");
     }
 
-    // Pre-transaction: validate locks and re-acquire expired ones
+    const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
+    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+    const isCourtAware = allCourts.length > 0;
+
+    // Pre-transaction: validate locks and collect assigned courts.
     const now = new Date();
-    const selectedSlotSet = new Set(normalizedSlots);
     const lockToSlotMap = new Map();
     const slotToCourtMap = new Map(); // tracks assigned court per slot (from lock)
 
@@ -1770,9 +1761,17 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
         throw new Error("Lock does not match selected slots");
       }
 
-      // If lock is expired or no longer active, try to re-acquire
-      if (lockData.status !== "locked" || expiresAt <= now) {
-        // Check if slot is still available (not locked by someone else)
+      if (lockData.status === "locked" && expiresAt > now) {
+        lockToSlotMap.set(slot, lockRef);
+        if (lockData.court) {
+          slotToCourtMap.set(slot, lockData.court);
+        }
+        continue;
+      }
+
+      // Legacy single-capacity turfs can re-acquire an expired lock only if nobody else holds it.
+      // Court-aware turfs reassign a currently available court below instead of trusting stale court data.
+      if (!isCourtAware) {
         const conflictSnapshot = await db
           .collection("slot_locks")
           .where("vendorId", "==", vendorId)
@@ -1794,7 +1793,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           throw new Error(`Slot ${slot} is now locked by another user. Refund will be issued.`);
         }
 
-        // Re-acquire: extend the lock
+        // Re-acquire: extend the lock.
         const newExpiresAt = new Date(now.getTime() + 10 * 60 * 1000);
         await lockRef.update({
           status: "locked",
@@ -1802,11 +1801,9 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           lockedAt: now,
         });
         console.log(`Lock ${lockId} re-acquired for slot ${slot}`);
-      }
-
-      lockToSlotMap.set(slot, lockRef);
-      if (lockData.court) {
-        slotToCourtMap.set(slot, lockData.court);
+        lockToSlotMap.set(slot, lockRef);
+      } else {
+        console.warn(`Lock ${lockId} expired or inactive for slot ${slot}; assigning a fresh available court after payment verification.`);
       }
     }
 
@@ -1817,43 +1814,56 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       }
     }
 
-    // For slots without assigned court (lock expired), assign one now if courts are configured
-    const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
-    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
-    if (allCourts.length > 0) {
-      for (const slot of normalizedSlots) {
-        if (slotToCourtMap.has(slot)) continue;
-        // Fetch existing courts taken for this slot
-        const [bookingsForSlot, locksForSlot] = await Promise.all([
-          db.collection("bookings")
-            .where("vendorId", "==", vendorId)
-            .where("turfId", "==", turfId)
-            .where("sports", "==", normalizedSport)
-            .where("date", "==", date)
-            .where("timeSlot", "==", slot)
-            .where("bookingStatus", "==", "confirmed")
-            .get(),
-          db.collection("slot_locks")
-            .where("vendorId", "==", vendorId)
-            .where("turfId", "==", turfId)
-            .where("sport", "==", normalizedSport)
-            .where("date", "==", date)
-            .where("timeSlot", "==", slot)
-            .where("status", "==", "locked")
-            .get(),
-        ]);
-        const takenCourts = [
-          ...bookingsForSlot.docs.map((d) => d.data().court).filter(Boolean),
-          ...locksForSlot.docs
-            .filter((d) => {
-              const exp = d.data().expiresAt?.toDate?.() || new Date(d.data().expiresAt);
-              return exp > now && d.data().userId !== userId;
-            })
-            .map((d) => d.data().court).filter(Boolean),
-        ];
-        const { court } = pickAvailableCourt(allCourts, takenCourts);
-        if (court) slotToCourtMap.set(slot, court);
+    // Capacity-aware final availability check before creating bookings.
+    for (const slot of normalizedSlots) {
+      const [bookingsForSlot, locksForSlot] = await Promise.all([
+        db.collection("bookings")
+          .where("vendorId", "==", vendorId)
+          .where("turfId", "==", turfId)
+          .where("sports", "==", normalizedSport)
+          .where("date", "==", date)
+          .where("timeSlot", "==", slot)
+          .where("bookingStatus", "==", "confirmed")
+          .get(),
+        db.collection("slot_locks")
+          .where("vendorId", "==", vendorId)
+          .where("turfId", "==", turfId)
+          .where("sport", "==", normalizedSport)
+          .where("date", "==", date)
+          .where("timeSlot", "==", slot)
+          .where("status", "==", "locked")
+          .get(),
+      ]);
+
+      const activeOtherLocks = locksForSlot.docs.filter((doc) => {
+        const lock = doc.data();
+        const exp = lock.expiresAt?.toDate?.() || new Date(lock.expiresAt);
+        return exp > now && lock.userId !== userId;
+      });
+
+      if (!isCourtAware) {
+        if (!bookingsForSlot.empty || activeOtherLocks.length > 0) {
+          throw new Error(`Slot already booked: ${slot}`);
+        }
+        continue;
       }
+
+      const takenCourts = [
+        ...bookingsForSlot.docs.map((d) => d.data().court).filter(Boolean),
+        ...activeOtherLocks.map((d) => d.data().court).filter(Boolean),
+      ];
+
+      const lockedCourt = slotToCourtMap.get(slot);
+      if (lockedCourt && !takenCourts.includes(lockedCourt)) {
+        continue;
+      }
+
+      const { court } = pickAvailableCourt(allCourts, takenCourts);
+      if (!court) {
+        throw new Error(`Slot already booked: ${slot}`);
+      }
+
+      slotToCourtMap.set(slot, court);
     }
 
     const bookingIds = await db.runTransaction(async (transaction) => {
