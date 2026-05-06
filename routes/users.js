@@ -23,6 +23,90 @@ const razorpay = new Razorpay({
 const isRazorpayConfigured = () =>
   !!process.env.RAZORPAY_KEY_ID && !!process.env.RAZORPAY_KEY_SECRET;
 
+const isTruthyFlag = (value) =>
+  value === true ||
+  value === 1 ||
+  (typeof value === "string" && ["1", "true", "yes"].includes(value.toLowerCase()));
+
+const isFalseyFlag = (value) =>
+  value === false ||
+  value === 0 ||
+  (typeof value === "string" && ["0", "false", "no"].includes(value.toLowerCase()));
+
+const isTurfHiddenFromUsers = (turfData = {}) => {
+  const status = String(turfData.status || turfData.turfStatus || "").toLowerCase();
+  return (
+    isTruthyFlag(turfData.deleted) ||
+    isTruthyFlag(turfData.isSuspended) ||
+    status === "suspended" ||
+    status === "inactive" ||
+    status === "disabled" ||
+    (turfData.isActive !== undefined && isFalseyFlag(turfData.isActive)) ||
+    (turfData.active !== undefined && isFalseyFlag(turfData.active))
+  );
+};
+
+const isVendorHiddenFromUsers = (vendorData = {}) => {
+  const status = String(vendorData.status || vendorData.vendorStatus || "").toLowerCase();
+  return (
+    isTruthyFlag(vendorData.deleted) ||
+    isTruthyFlag(vendorData.isSuspended) ||
+    status === "suspended" ||
+    status === "inactive" ||
+    status === "disabled" ||
+    (vendorData.isActive !== undefined && isFalseyFlag(vendorData.isActive)) ||
+    (vendorData.active !== undefined && isFalseyFlag(vendorData.active))
+  );
+};
+
+const isVenueHiddenFromUsers = (turfData = {}, vendorData = {}) =>
+  isTurfHiddenFromUsers(turfData) || isVendorHiddenFromUsers(vendorData);
+
+const getSportTimeRangesForDate = (sportData = {}, date) => {
+  const bookingDate = date ? new Date(date) : new Date();
+  const isWeekend = [0, 6].includes(bookingDate.getDay());
+  const ranges = isWeekend && Array.isArray(sportData.weekendTimeSlots) && sportData.weekendTimeSlots.length > 0
+    ? sportData.weekendTimeSlots
+    : !isWeekend && Array.isArray(sportData.weekdayTimeSlots) && sportData.weekdayTimeSlots.length > 0
+      ? sportData.weekdayTimeSlots
+      : Array.isArray(sportData.timeSlots)
+        ? sportData.timeSlots
+        : [];
+  return ranges;
+};
+
+const generateSlotStrings = (timeRanges = [], duration = 60) => {
+  const safeDuration = Number(duration) > 0 ? Number(duration) : 60;
+  const slots = [];
+
+  const parseMinutes = (time) => {
+    if (typeof time !== "string" || !time.includes(":")) return null;
+    const [hours, minutes] = time.split(":").map(Number);
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+    return hours * 60 + minutes;
+  };
+
+  timeRanges.forEach((range) => {
+    let start = parseMinutes(range?.open);
+    let end = parseMinutes(range?.close);
+    if (start === null || end === null) return;
+    if (end <= start) end += 24 * 60;
+
+    for (let current = start; current + safeDuration <= end; current += safeDuration) {
+      const next = current + safeDuration;
+      const fmt = (mins) => {
+        const normalized = ((mins % (24 * 60)) + (24 * 60)) % (24 * 60);
+        const h = Math.floor(normalized / 60);
+        const m = normalized % 60;
+        return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+      };
+      slots.push(`${fmt(current)} - ${fmt(next)}`);
+    }
+  });
+
+  return slots;
+};
+
 // JWT Generator (Your Own Token)
 const generateToken = (uid) => {
   return jwt.sign({ uid, role: "user" }, process.env.JWT_SECRET, {
@@ -133,12 +217,15 @@ const computeBookingSummary = async ({
   selectedSlots,
   date,
 }) => {
-  const turfRef = db
-    .collection("vendors")
-    .doc(vendorId)
-    .collection("turfs")
-    .doc(turfId);
-  const turfSnap = await turfRef.get();
+  const vendorRef = db.collection("vendors").doc(vendorId);
+  const turfRef = vendorRef.collection("turfs").doc(turfId);
+  const [vendorSnap, turfSnap] = await Promise.all([vendorRef.get(), turfRef.get()]);
+
+  if (!vendorSnap.exists) {
+    const err = new Error("Vendor not found");
+    err.status = 404;
+    throw err;
+  }
 
   if (!turfSnap.exists) {
     const err = new Error("Turf not found");
@@ -146,7 +233,14 @@ const computeBookingSummary = async ({
     throw err;
   }
 
+  const vendorData = vendorSnap.data();
   const turfData = turfSnap.data();
+  if (isVenueHiddenFromUsers(turfData, vendorData)) {
+    const err = new Error("This turf is currently unavailable for booking");
+    err.status = 404;
+    throw err;
+  }
+
   const normalizedSport = sports.trim().toLowerCase();
 
   const selectedSportData = (turfData.sports || []).find(
@@ -182,8 +276,15 @@ const computeBookingSummary = async ({
   const taxRate = Number(taxSnap.exists ? taxSnap.data().percentage : 0) || 0;
   const taxAmount = Math.round((baseAmount * taxRate) / 100);
   const settingsData = settingsSnap.exists ? settingsSnap.data() : {};
-  const convenienceFee = (Number(settingsData.convenienceFee) || 35) * totalSlots;
-  const discountRate = Number(settingsData.discountRate) || 10;
+  const configuredConvenienceFee = Number(settingsData.convenienceFee);
+  const convenienceFeePerSlot = Number.isFinite(configuredConvenienceFee)
+    ? configuredConvenienceFee
+    : 35;
+  const configuredDiscountRate = Number(settingsData.discountRate);
+  const discountRate = Number.isFinite(configuredDiscountRate)
+    ? configuredDiscountRate
+    : 0;
+  const convenienceFee = convenienceFeePerSlot * totalSlots;
   const subtotal = baseAmount + taxAmount + convenienceFee;
   const discountAmount = Math.round((subtotal * discountRate) / 100);
   const finalAmount = subtotal - discountAmount;
@@ -392,6 +493,8 @@ router.post("/users/nearby-venues", async (req, res) => {
     const vendorTurfArrays = await Promise.all(
       vendorsSnapshot.docs.map(async (vendorDoc) => {
         const vendorData = vendorDoc.data();
+        if (isVendorHiddenFromUsers(vendorData)) return [];
+
         const turfsSnapshot = await db
           .collection("vendors")
           .doc(vendorDoc.id)
@@ -401,7 +504,7 @@ router.post("/users/nearby-venues", async (req, res) => {
         const turfs = [];
         turfsSnapshot.forEach((turfDoc) => {
           const turfData = turfDoc.data();
-          if (turfData.deleted) return;
+          if (isVenueHiddenFromUsers(turfData, vendorData)) return;
           if (!turfData.vendorCoordinates) return;
 
           const dist = getDistance(
@@ -463,6 +566,8 @@ router.post("/users/search-turfs", async (req, res) => {
     const vendorTurfArrays = await Promise.all(
       vendorsSnapshot.docs.map(async (vendorDoc) => {
         const vendorData = vendorDoc.data();
+        if (isVendorHiddenFromUsers(vendorData)) return [];
+
         const turfsSnapshot = await db
           .collection("vendors")
           .doc(vendorDoc.id)
@@ -472,7 +577,7 @@ router.post("/users/search-turfs", async (req, res) => {
         const turfs = [];
         turfsSnapshot.forEach((turfDoc) => {
           const turf = turfDoc.data();
-          if (turf.deleted) return;
+          if (isVenueHiddenFromUsers(turf, vendorData)) return;
 
           const matchesTitle = turf.title?.toLowerCase().includes(lowerKeyword);
           const matchesSport =
@@ -556,6 +661,8 @@ router.post("/users/filter-turfs", async (req, res) => {
     const vendorTurfArrays = await Promise.all(
       vendorsSnapshot.docs.map(async (vendorDoc) => {
         const vendorData = vendorDoc.data();
+        if (isVendorHiddenFromUsers(vendorData)) return [];
+
         const turfsSnapshot = await db
           .collection("vendors")
           .doc(vendorDoc.id)
@@ -577,7 +684,7 @@ router.post("/users/filter-turfs", async (req, res) => {
 
           if (dist > maxDistanceKm) return;
 
-          if (turf.deleted) return;
+          if (isVenueHiddenFromUsers(turf, vendorData)) return;
 
           if (sportsType && !turf.sports.some((s) => s.name.toLowerCase() === sportsType.toLowerCase())) return;
 
@@ -636,6 +743,9 @@ router.get("/users/turfs/:turfId", async (req, res) => {
     const vendorSnapshot = await db.collection("vendors").get();
 
     for (const vendorDoc of vendorSnapshot.docs) {
+      const vendorData = vendorDoc.data();
+      if (isVendorHiddenFromUsers(vendorData)) continue;
+
       const turfRef = db
         .collection("vendors")
         .doc(vendorDoc.id)
@@ -646,8 +756,7 @@ router.get("/users/turfs/:turfId", async (req, res) => {
 
       if (turfDoc.exists) {
         const turfData = turfDoc.data();
-        if (turfData.deleted) continue;
-        const vendorData = vendorDoc.data();
+        if (isVenueHiddenFromUsers(turfData, vendorData)) continue;
 
         return res.status(200).json({
           turfId: turfDoc.id,
@@ -728,57 +837,85 @@ router.post("/bookings/available-slots", checkUserAuth, async (req, res) => {
     }
 
     // ✅ Step 1: Fetch turf details first
-    const turfRef = db
-      .collection("vendors")
-      .doc(vendorId)
-      .collection("turfs")
-      .doc(turfId);
-    const turfDoc = await turfRef.get();
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const turfRef = vendorRef.collection("turfs").doc(turfId);
+    const [vendorDoc, turfDoc] = await Promise.all([vendorRef.get(), turfRef.get()]);
+
+    if (!vendorDoc.exists) {
+      return res.status(404).json({ message: "Vendor not found" });
+    }
 
     if (!turfDoc.exists) {
       return res.status(404).json({ message: "Turf not found" });
     }
 
+    const vendorData = vendorDoc.data();
     const turfData = turfDoc.data();
 
     // ✅ Step 2: Check if turf is suspended
-    if (turfData.isSuspended === 1) {
+    if (isVenueHiddenFromUsers(turfData, vendorData)) {
       return res.status(200).json({
-        message: "This turf is currently suspended and cannot accept bookings.",
+        message: "This turf is currently unavailable and cannot accept bookings.",
         turfId,
         availableSlots: [],
         totalAvailable: 0,
       });
     }
 
-    const allSlots = turfData.timeSlots || [];
+    const normalizedSport = sports.trim().toLowerCase();
+    const sportData = (turfData.sports || []).find(
+      (s) => s.name?.toLowerCase() === normalizedSport
+    );
+
+    if (!sportData) {
+      return res.status(400).json({ message: "Sport not available for this turf" });
+    }
+
+    const timeRanges = getSportTimeRangesForDate(sportData, date);
+    const allSlots = generateSlotStrings(timeRanges, sportData.slotDuration || 60);
 
     // Determine court capacity (if configured)
     const { getCourtsForSport } = require("../utils/courtHelper");
-    const allCourts = await getCourtsForSport(vendorId, turfId, sports);
+    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
     const capacity = allCourts.length > 0 ? allCourts.length : 1;
 
     // ✅ Step 3: Fetch bookings for the given date & sports
-    const bookingsSnapshot = await db
-      .collection("bookings")
-      .where("vendorId", "==", vendorId)
-      .where("turfId", "==", turfId)
-      .where("date", "==", date)
-      .where("sports", "==", sports)
-      .get();
+    const now = new Date();
+    const [bookingsSnapshot, locksSnapshot] = await Promise.all([
+      db.collection("bookings")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("date", "==", date)
+        .where("sports", "==", normalizedSport)
+        .where("bookingStatus", "==", "confirmed")
+        .get(),
+      db.collection("slot_locks")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("date", "==", date)
+        .where("sport", "==", normalizedSport)
+        .where("status", "==", "locked")
+        .get(),
+    ]);
 
     // Count confirmed bookings per slot; slot is fully booked only when count >= capacity
     const bookingsPerSlot = {};
     bookingsSnapshot.forEach((doc) => {
       const b = doc.data();
-      if (b.bookingStatus === "confirmed") {
-        bookingsPerSlot[b.timeSlot] = (bookingsPerSlot[b.timeSlot] || 0) + 1;
-      }
+      bookingsPerSlot[b.timeSlot] = (bookingsPerSlot[b.timeSlot] || 0) + 1;
+    });
+
+    const locksPerSlot = {};
+    locksSnapshot.forEach((doc) => {
+      const lock = doc.data();
+      const expiresAt = lock.expiresAt?.toDate?.() || new Date(lock.expiresAt);
+      if (expiresAt <= now) return;
+      locksPerSlot[lock.timeSlot] = (locksPerSlot[lock.timeSlot] || 0) + 1;
     });
 
     // ✅ Step 4: Filter out only fully-booked slots
     const availableSlots = allSlots.filter(
-      (slot) => (bookingsPerSlot[slot] || 0) < capacity
+      (slot) => ((bookingsPerSlot[slot] || 0) + (locksPerSlot[slot] || 0)) < capacity
     );
 
     res.status(200).json({
@@ -973,23 +1110,24 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
     // =====================================================
     // 1️⃣ FETCH TURF DATA (Check suspension + sports structure)
     // =====================================================
-    const turfRef = db
-      .collection("vendors")
-      .doc(vendorId)
-      .collection("turfs")
-      .doc(turfId);
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const turfRef = vendorRef.collection("turfs").doc(turfId);
 
-    const turfDoc = await turfRef.get();
+    const [vendorDoc, turfDoc] = await Promise.all([vendorRef.get(), turfRef.get()]);
+    if (!vendorDoc.exists) {
+      return res.status(404).json({ message: "Vendor not found" });
+    }
     if (!turfDoc.exists) {
       return res.status(404).json({ message: "Turf not found" });
     }
 
+    const vendorData = vendorDoc.data();
     const turfData = turfDoc.data();
 
-    if (turfData.isSuspended === 1) {
+    if (isVenueHiddenFromUsers(turfData, vendorData)) {
       return res.status(200).json({
         available: false,
-        message: "This turf is suspended and cannot accept bookings.",
+        message: "This turf is unavailable and cannot accept bookings.",
         suggestedSlots: [],
       });
     }
@@ -1007,8 +1145,10 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
       });
     }
 
-    // Each timeSlot looks like: { open: "06:00", close: "07:00" }
-    const allSlots = sportObj.timeSlots.map((ts) => `${ts.open}-${ts.close}`);
+    const allSlots = generateSlotStrings(
+      getSportTimeRangesForDate(sportObj, date),
+      sportObj.slotDuration || 60
+    );
 
     if (!allSlots.includes(slot)) {
       return res.status(400).json({
@@ -1019,18 +1159,37 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
     // =====================================================
     // 3️⃣ CHECK BOOKINGS COLLECTION (canonical source of truth)
     // =====================================================
-    const bookingSnapshot = await db
-      .collection("bookings")
-      .where("vendorId", "==", vendorId)
-      .where("turfId", "==", turfId)
-      .where("sports", "==", sportName)
-      .where("date", "==", date)
-      .where("timeSlot", "==", slot)
-      .where("bookingStatus", "==", "confirmed")
-      .limit(1)
-      .get();
+    const { getCourtsForSport } = require("../utils/courtHelper");
+    const allCourts = await getCourtsForSport(vendorId, turfId, sportName);
+    const capacity = allCourts.length > 0 ? allCourts.length : 1;
+    const now = new Date();
 
-    const isBooked = !bookingSnapshot.empty;
+    const [bookingSnapshot, lockSnapshot] = await Promise.all([
+      db.collection("bookings")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sports", "==", sportName)
+        .where("date", "==", date)
+        .where("timeSlot", "==", slot)
+        .where("bookingStatus", "==", "confirmed")
+        .get(),
+      db.collection("slot_locks")
+        .where("vendorId", "==", vendorId)
+        .where("turfId", "==", turfId)
+        .where("sport", "==", sportName)
+        .where("date", "==", date)
+        .where("timeSlot", "==", slot)
+        .where("status", "==", "locked")
+        .get(),
+    ]);
+
+    const activeLocks = lockSnapshot.docs.filter((doc) => {
+      const lock = doc.data();
+      const expiresAt = lock.expiresAt?.toDate?.() || new Date(lock.expiresAt);
+      return expiresAt > now;
+    });
+    const takenCount = bookingSnapshot.size + activeLocks.length;
+    const isBooked = takenCount >= capacity;
 
     // =====================================================
     // 4️⃣ IF NOT BOOKED → AVAILABLE
@@ -1039,6 +1198,8 @@ router.post("/bookings/check-availability", checkUserAuth, async (req, res) => {
       return res.status(200).json({
         available: true,
         message: "Slot is available",
+        availableCount: capacity - takenCount,
+        capacity,
       });
     }
 
@@ -1683,16 +1844,20 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       });
     }
 
-    const turfRef = db
-      .collection("vendors")
-      .doc(vendorId)
-      .collection("turfs")
-      .doc(turfId);
-    const turfDoc = await turfRef.get();
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const turfRef = vendorRef.collection("turfs").doc(turfId);
+    const [vendorDoc, turfDoc] = await Promise.all([vendorRef.get(), turfRef.get()]);
+    if (!vendorDoc.exists) {
+      return res.status(404).json({ message: "Vendor not found" });
+    }
     if (!turfDoc.exists) {
       return res.status(404).json({ message: "Turf not found" });
     }
+    const vendorData = vendorDoc.data();
     const turfData = turfDoc.data();
+    if (isVenueHiddenFromUsers(turfData, vendorData)) {
+      return res.status(404).json({ message: "This turf is currently unavailable for booking" });
+    }
 
     // Derive booking metadata from turfData and order notes
     const sportData = (turfData.sports || []).find(
@@ -1711,31 +1876,61 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       turfTitle,
     };
 
-    const vendorDoc = await db.collection("vendors").doc(vendorId).get();
-    const vendorData = vendorDoc.exists ? vendorDoc.data() : { name: "Unknown Vendor" };
-
     const userLockIds = userLocks
       .map((lock) => lock?.lockId)
       .filter((id) => typeof id === "string" && id.trim());
 
     const selectedSlotSet = new Set(normalizedSlots);
-    if (selectedSlotSet.size !== normalizedSlots.length) {
-      throw new Error("Duplicate selected slots are not supported");
-    }
+    const selectedSlotHasDuplicates = selectedSlotSet.size !== normalizedSlots.length;
 
     const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
     const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
     const isCourtAware = allCourts.length > 0;
+    if (!isCourtAware && selectedSlotHasDuplicates) {
+      throw new Error("Duplicate selected slots are not supported");
+    }
+
+    const selectedSlotCounts = new Map();
+    normalizedSlots.forEach((slot) => {
+      selectedSlotCounts.set(slot, (selectedSlotCounts.get(slot) || 0) + 1);
+    });
+    if (isCourtAware) {
+      for (const [slot, count] of selectedSlotCounts) {
+        if (count > allCourts.length) {
+          throw new Error(`Slot capacity exceeded: ${slot}`);
+        }
+      }
+    }
 
     // Pre-transaction: validate locks and collect assigned courts.
     const now = new Date();
     const lockToSlotMap = new Map();
     const slotToCourtMap = new Map(); // tracks assigned court per slot (from lock)
+    const acceptedLockCounts = new Map();
+    const selectedLockIds = new Set();
+    const bookingItems = [];
+    const addBookingItem = ({ slot, lockRef = null, lockId = null, court = null }) => {
+      const requestedCount = selectedSlotCounts.get(slot) || 0;
+      const acceptedCount = acceptedLockCounts.get(slot) || 0;
+      if (acceptedCount >= requestedCount) return false;
+      const item = { slot, lockRef, lockId, court };
+      bookingItems.push(item);
+      acceptedLockCounts.set(slot, acceptedCount + 1);
+      if (lockId) selectedLockIds.add(lockId);
+      return true;
+    };
 
-    for (const lockId of userLockIds) {
+    for (const lockInput of userLocks) {
+      const lockId = typeof lockInput?.lockId === "string" ? lockInput.lockId.trim() : "";
+      const requestedSlot = typeof lockInput?.slot === "string" ? lockInput.slot.trim() : "";
+      if (!lockId || selectedLockIds.has(lockId)) continue;
       const lockRef = db.collection("slot_locks").doc(lockId);
       const lockDoc = await lockRef.get();
       if (!lockDoc.exists) {
+        if (!requestedSlot || !selectedSlotCounts.has(requestedSlot)) {
+          throw new Error("Lock does not match selected slots");
+        }
+        addBookingItem({ slot: requestedSlot });
         // Lock was cleaned up after expiry. Payment is already verified and
         // duplicate booking was checked above — log and skip this lock.
         console.warn(`Lock ${lockId} not found (likely expired after payment). Continuing with verified payment.`);
@@ -1762,6 +1957,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       }
 
       if (lockData.status === "locked" && expiresAt > now) {
+        addBookingItem({ slot, lockRef, lockId, court: lockData.court || null });
         lockToSlotMap.set(slot, lockRef);
         if (lockData.court) {
           slotToCourtMap.set(slot, lockData.court);
@@ -1801,21 +1997,28 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           lockedAt: now,
         });
         console.log(`Lock ${lockId} re-acquired for slot ${slot}`);
+        addBookingItem({ slot, lockRef, lockId });
         lockToSlotMap.set(slot, lockRef);
       } else {
+        addBookingItem({ slot });
         console.warn(`Lock ${lockId} expired or inactive for slot ${slot}; assigning a fresh available court after payment verification.`);
       }
     }
 
     // Fill in any slots whose locks were cleaned up (payment already verified above)
     for (const slot of normalizedSlots) {
+      while ((acceptedLockCounts.get(slot) || 0) < (selectedSlotCounts.get(slot) || 0)) {
+        addBookingItem({ slot });
+      }
       if (!lockToSlotMap.has(slot)) {
         lockToSlotMap.set(slot, null); // null = lock expired, slot booking proceeds via payment trust
       }
     }
 
     // Capacity-aware final availability check before creating bookings.
-    for (const slot of normalizedSlots) {
+    const assignedCourtsBySlot = new Map();
+    for (const item of bookingItems) {
+      const { slot } = item;
       const [bookingsForSlot, locksForSlot] = await Promise.all([
         db.collection("bookings")
           .where("vendorId", "==", vendorId)
@@ -1838,7 +2041,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       const activeOtherLocks = locksForSlot.docs.filter((doc) => {
         const lock = doc.data();
         const exp = lock.expiresAt?.toDate?.() || new Date(lock.expiresAt);
-        return exp > now && lock.userId !== userId;
+        return exp > now && !selectedLockIds.has(doc.id);
       });
 
       if (!isCourtAware) {
@@ -1851,10 +2054,13 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
       const takenCourts = [
         ...bookingsForSlot.docs.map((d) => d.data().court).filter(Boolean),
         ...activeOtherLocks.map((d) => d.data().court).filter(Boolean),
+        ...(assignedCourtsBySlot.get(slot) || []),
       ];
 
-      const lockedCourt = slotToCourtMap.get(slot);
+      const lockedCourt = item.court;
       if (lockedCourt && !takenCourts.includes(lockedCourt)) {
+        item.court = lockedCourt;
+        assignedCourtsBySlot.set(slot, [...(assignedCourtsBySlot.get(slot) || []), lockedCourt]);
         continue;
       }
 
@@ -1863,12 +2069,15 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
         throw new Error(`Slot already booked: ${slot}`);
       }
 
+      item.court = court;
+      assignedCourtsBySlot.set(slot, [...(assignedCourtsBySlot.get(slot) || []), court]);
       slotToCourtMap.set(slot, court);
     }
 
     const bookingIds = await db.runTransaction(async (transaction) => {
       // Re-read locks inside transaction to ensure consistency
-      for (const [slot, lockRef] of lockToSlotMap) {
+      for (const item of bookingItems) {
+        const { slot, lockRef } = item;
         if (!lockRef) continue; // lock was cleaned up after expiry; payment already verified
         const lockDoc = await transaction.get(lockRef);
         if (!lockDoc.exists) {
@@ -1892,7 +2101,8 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
         .doc(date);
       const createdAt = new Date().toISOString();
 
-      for (const slot of normalizedSlots) {
+      for (const item of bookingItems) {
+        const { slot } = item;
 
         const bookingRef = db.collection("bookings").doc();
         transaction.set(bookingRef, {
@@ -1909,7 +2119,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           date,
           timeSlot: slot,
           sports: normalizedSport,
-          court: slotToCourtMap.get(slot) || null,
+          court: item.court || null,
           amount: expectedSummary.pricePerSlot,
           finalAmount: expectedSummary.finalAmount,
           paymentStatus: "confirmed",
@@ -1933,7 +2143,7 @@ router.post("/bookings/verify-payment", checkUserAuth, rejectGuest, async (req, 
           { merge: true }
         );
 
-        const lockRef = lockToSlotMap.get(slot);
+        const lockRef = item.lockRef;
         if (lockRef) {
           transaction.update(lockRef, {
             status: "confirmed",
@@ -2455,4 +2665,3 @@ function isSlotWithin2Hours(timeSlot, targetTime) {
 // Removed duplicate /bookings/cancel-booking route — use /cancel-booking above
 
 module.exports = router;
-

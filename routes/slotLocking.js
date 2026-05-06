@@ -4,11 +4,49 @@ const { db } = require("../firebase/firebase");
 const { v4: uuidv4 } = require("uuid");
 const checkUserAuth = require("../middleware/checkUserAuth");
 const { rejectGuest } = require("../middleware/checkUserAuth");
-const { getCourtsForSport, pickAvailableCourt } = require("../utils/courtHelper");
+const { pickAvailableCourt } = require("../utils/courtHelper");
 
 // Lock expiration time in minutes
 const LOCK_EXPIRATION_MINUTES = 10;
 
+const isTruthyFlag = (value) =>
+  value === true ||
+  value === 1 ||
+  (typeof value === "string" && ["1", "true", "yes"].includes(value.toLowerCase()));
+
+const isFalseyFlag = (value) =>
+  value === false ||
+  value === 0 ||
+  (typeof value === "string" && ["0", "false", "no"].includes(value.toLowerCase()));
+
+const isTurfHiddenFromUsers = (turfData = {}) => {
+  const status = String(turfData.status || turfData.turfStatus || "").toLowerCase();
+  return (
+    isTruthyFlag(turfData.deleted) ||
+    isTruthyFlag(turfData.isSuspended) ||
+    status === "suspended" ||
+    status === "inactive" ||
+    status === "disabled" ||
+    (turfData.isActive !== undefined && isFalseyFlag(turfData.isActive)) ||
+    (turfData.active !== undefined && isFalseyFlag(turfData.active))
+  );
+};
+
+const isVendorHiddenFromUsers = (vendorData = {}) => {
+  const status = String(vendorData.status || vendorData.vendorStatus || "").toLowerCase();
+  return (
+    isTruthyFlag(vendorData.deleted) ||
+    isTruthyFlag(vendorData.isSuspended) ||
+    status === "suspended" ||
+    status === "inactive" ||
+    status === "disabled" ||
+    (vendorData.isActive !== undefined && isFalseyFlag(vendorData.isActive)) ||
+    (vendorData.active !== undefined && isFalseyFlag(vendorData.active))
+  );
+};
+
+const isVenueHiddenFromUsers = (turfData = {}, vendorData = {}) =>
+  isTurfHiddenFromUsers(turfData) || isVendorHiddenFromUsers(vendorData);
 
 // ============================================
 // 1. LOCK A SLOT (when user selects it)
@@ -24,90 +62,151 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
 
     const normalizedSport = sport.trim().toLowerCase();
     const normalizedSlot = timeSlot.trim();
-    const now = new Date();
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const turfRef = vendorRef.collection("turfs").doc(turfId);
 
-    // Fetch courts configured for this sport
-    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+    const result = await db.runTransaction(async (transaction) => {
+      const now = new Date();
+      const [vendorDoc, turfDoc, bookingSnapshot, lockSnapshot] = await Promise.all([
+        transaction.get(vendorRef),
+        transaction.get(turfRef),
+        transaction.get(
+          db.collection("bookings")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sports", "==", normalizedSport)
+            .where("date", "==", date)
+            .where("timeSlot", "==", normalizedSlot)
+            .where("bookingStatus", "==", "confirmed")
+        ),
+        transaction.get(
+          db.collection("slot_locks")
+            .where("vendorId", "==", vendorId)
+            .where("turfId", "==", turfId)
+            .where("sport", "==", normalizedSport)
+            .where("date", "==", date)
+            .where("timeSlot", "==", normalizedSlot)
+            .where("status", "==", "locked")
+        ),
+      ]);
 
-    // Fetch existing bookings and locks for this slot
-    const [bookingSnapshot, lockSnapshot] = await Promise.all([
-      db.collection("bookings")
-        .where("vendorId", "==", vendorId)
-        .where("turfId", "==", turfId)
-        .where("sports", "==", normalizedSport)
-        .where("date", "==", date)
-        .where("timeSlot", "==", normalizedSlot)
-        .where("bookingStatus", "==", "confirmed")
-        .get(),
-      db.collection("slot_locks")
-        .where("vendorId", "==", vendorId)
-        .where("turfId", "==", turfId)
-        .where("sport", "==", normalizedSport)
-        .where("date", "==", date)
-        .where("timeSlot", "==", normalizedSlot)
-        .where("status", "==", "locked")
-        .get(),
-    ]);
-
-    // Active (non-expired) locks
-    const activeLocks = lockSnapshot.docs.filter((doc) => {
-      const lockData = doc.data();
-      const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
-      return expiresAt > now;
-    });
-
-    // If user already has a lock on this slot, extend it
-    const existingUserLock = activeLocks.find((d) => d.data().userId === userId);
-    if (existingUserLock) {
-      const lockId = existingUserLock.id;
-      const newExpiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
-      await db.collection("slot_locks").doc(lockId).update({
-        expiresAt: newExpiresAt,
-        lockedAt: now,
-      });
-      return res.status(200).json({
-        status: "success",
-        lockId,
-        expiresAt: newExpiresAt,
-        court: existingUserLock.data().court || null,
-        message: "Lock extended for 10 minutes",
-      });
-    }
-
-    // Legacy path: no courts configured → treat as single capacity
-    if (allCourts.length === 0) {
-      if (bookingSnapshot.size > 0) {
-        return res.status(409).json({ status: "booked", message: "Slot already booked" });
+      if (!vendorDoc.exists) {
+        return { code: 404, body: { message: "Vendor not found" } };
       }
-      if (activeLocks.length > 0) {
-        const existingLock = activeLocks[0].data();
-        const expiresAt = existingLock.expiresAt?.toDate?.() || new Date(existingLock.expiresAt);
-        return res.status(409).json({
+
+      if (!turfDoc.exists) {
+        return { code: 404, body: { message: "Turf not found" } };
+      }
+
+      const vendorData = vendorDoc.data();
+      const turfData = turfDoc.data();
+      if (isVenueHiddenFromUsers(turfData, vendorData)) {
+        return {
+          code: 409,
+          body: {
+            status: "unavailable",
+            message: "This turf is currently unavailable and cannot accept bookings",
+          },
+        };
+      }
+
+      const sportData = (turfData.sports || []).find(
+        (s) => s.name?.toLowerCase() === normalizedSport
+      );
+
+      if (!sportData) {
+        return { code: 400, body: { message: "Sport not available for this turf" } };
+      }
+
+      const allCourts = sportData?.courts || [];
+      const activeLocks = lockSnapshot.docs.filter((doc) => {
+        const lockData = doc.data();
+        const expiresAt = lockData.expiresAt?.toDate?.() || new Date(lockData.expiresAt);
+        return expiresAt > now;
+      });
+
+      const existingUserLock = activeLocks.find((d) => d.data().userId === userId);
+      if (existingUserLock && allCourts.length === 0) {
+        const lockData = existingUserLock.data();
+        const lockId = lockData.lockId || existingUserLock.id;
+        const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
+        transaction.update(existingUserLock.ref, { expiresAt, lockedAt: now });
+        return {
+          code: 200,
+          body: {
+            status: "success",
+            lockId,
+            expiresAt,
+            message: "Lock extended for 10 minutes",
+          },
+        };
+      }
+
+      if (allCourts.length === 0) {
+        if (bookingSnapshot.size > 0) {
+          return { code: 409, body: { status: "booked", message: "Slot already booked" } };
+        }
+        if (activeLocks.length > 0) {
+          const existingLock = activeLocks[0].data();
+          const expiresAt = existingLock.expiresAt?.toDate?.() || new Date(existingLock.expiresAt);
+          return {
+            code: 409,
+            body: {
+              status: "locked",
+              message: "Slot is being booked by another user",
+              expiresIn: Math.ceil((expiresAt - now) / 1000),
+            },
+          };
+        }
+      } else {
+        const takenCourts = [
+          ...bookingSnapshot.docs.map((d) => d.data().court).filter(Boolean),
+          ...activeLocks.map((d) => d.data().court).filter(Boolean),
+        ];
+        const { court: availableCourt, availableCount } = pickAvailableCourt(allCourts, takenCourts);
+
+        if (availableCount === 0 || !availableCourt) {
+          return {
+            code: 409,
+            body: {
+              status: "booked",
+              message: "All courts are booked for this slot",
+            },
+          };
+        }
+
+        const lockId = uuidv4();
+        const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
+        const lockRef = db.collection("slot_locks").doc(lockId);
+        transaction.set(lockRef, {
+          lockId,
+          vendorId,
+          turfId,
+          sport: normalizedSport,
+          date,
+          timeSlot: normalizedSlot,
+          userId,
+          court: availableCourt,
+          lockedAt: now,
+          expiresAt,
           status: "locked",
-          message: "Slot is being booked by another user",
-          expiresIn: Math.ceil((expiresAt - now) / 1000),
         });
-      }
-    } else {
-      // Court-aware path: figure out which courts are taken
-      const takenCourts = [
-        ...bookingSnapshot.docs.map((d) => d.data().court).filter(Boolean),
-        ...activeLocks.map((d) => d.data().court).filter(Boolean),
-      ];
-      const { court: availableCourt, availableCount } = pickAvailableCourt(allCourts, takenCourts);
 
-      if (availableCount === 0 || !availableCourt) {
-        return res.status(409).json({
-          status: "booked",
-          message: "All courts are booked for this slot",
-        });
+        return {
+          code: 200,
+          body: {
+            status: "success",
+            lockId,
+            expiresAt,
+            message: "Slot locked for 10 minutes",
+          },
+        };
       }
 
-      // Create new lock with the assigned court
       const lockId = uuidv4();
       const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
-
-      await db.collection("slot_locks").doc(lockId).set({
+      const lockRef = db.collection("slot_locks").doc(lockId);
+      transaction.set(lockRef, {
         lockId,
         vendorId,
         turfId,
@@ -115,45 +214,24 @@ router.post("/slots/lock", checkUserAuth, rejectGuest, async (req, res) => {
         date,
         timeSlot: normalizedSlot,
         userId,
-        court: availableCourt,
+        court: null,
         lockedAt: now,
         expiresAt,
         status: "locked",
       });
 
-      return res.status(200).json({
-        status: "success",
-        lockId,
-        expiresAt,
-        court: availableCourt,
-        message: "Slot locked for 10 minutes",
-      });
-    }
-
-    // Fallback (no courts, no bookings, no locks) — create a plain lock
-    const lockId = uuidv4();
-    const expiresAt = new Date(now.getTime() + LOCK_EXPIRATION_MINUTES * 60 * 1000);
-    await db.collection("slot_locks").doc(lockId).set({
-      lockId,
-      vendorId,
-      turfId,
-      sport: normalizedSport,
-      date,
-      timeSlot: normalizedSlot,
-      userId,
-      court: null,
-      lockedAt: now,
-      expiresAt,
-      status: "locked",
+      return {
+        code: 200,
+        body: {
+          status: "success",
+          lockId,
+          expiresAt,
+          message: "Slot locked for 10 minutes",
+        },
+      };
     });
 
-    res.status(200).json({
-      status: "success",
-      lockId,
-      expiresAt,
-      court: null,
-      message: "Slot locked for 10 minutes",
-    });
+    return res.status(result.code).json(result.body);
   } catch (err) {
     console.error("Error locking slot:", err);
     res.status(500).json({ message: "Internal server error" });
@@ -206,8 +284,30 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
 
     const normalizedSport = sport.trim().toLowerCase();
 
-    // Fetch courts configured for this sport (capacity)
-    const allCourts = await getCourtsForSport(vendorId, turfId, normalizedSport);
+    const vendorRef = db.collection("vendors").doc(vendorId);
+    const turfRef = vendorRef.collection("turfs").doc(turfId);
+    const [vendorDoc, turfDoc] = await Promise.all([vendorRef.get(), turfRef.get()]);
+
+    if (!vendorDoc.exists) {
+      return res.status(404).json({ message: "Vendor not found" });
+    }
+
+    if (!turfDoc.exists) {
+      return res.status(404).json({ message: "Turf not found" });
+    }
+
+    const vendorData = vendorDoc.data();
+    const turfData = turfDoc.data();
+    if (isVenueHiddenFromUsers(turfData, vendorData)) {
+      return res.status(409).json({
+        message: "This turf is currently unavailable and cannot accept bookings",
+      });
+    }
+
+    const sportData = (turfData.sports || []).find(
+      (s) => s.name?.toLowerCase() === normalizedSport
+    );
+    const allCourts = sportData?.courts || [];
     // If no courts configured, treat each slot as capacity 1 (legacy behavior)
     const totalCapacity = allCourts.length > 0 ? allCourts.length : 1;
 
@@ -256,25 +356,47 @@ router.post("/slots/status", checkUserAuth, async (req, res) => {
       const bookedCount = bookingsPerSlot[normalizedSlot] || 0;
       const activeLocks = locksPerSlot[normalizedSlot] || [];
       const takenCount = bookedCount + activeLocks.length;
+      const myLocks = activeLocks.filter((l) => l.userId === userId);
+      const availableCount = Math.max(totalCapacity - takenCount, 0);
+      const baseStatus = {
+        slot,
+        capacity: totalCapacity,
+        bookedCount,
+        lockedCount: activeLocks.length,
+        selectedCount: myLocks.length,
+        availableCount,
+      };
 
       // Full capacity taken → booked
       if (takenCount >= totalCapacity) {
         // Prefer showing "selected" if one of the locks is the current user's
         const myLock = activeLocks.find((l) => l.userId === userId);
         if (myLock) {
-          return { slot, status: "selected", lockId: myLock.lockId, expiresAt: myLock.expiresAt };
+          return {
+            ...baseStatus,
+            status: "selected",
+            lockId: myLock.lockId,
+            lockIds: myLocks.map((l) => l.lockId),
+            expiresAt: myLock.expiresAt,
+          };
         }
-        return { slot, status: "booked" };
+        return { ...baseStatus, status: "booked" };
       }
 
       // Not full — if current user has a lock here, show selected
       const myLock = activeLocks.find((l) => l.userId === userId);
       if (myLock) {
-        return { slot, status: "selected", lockId: myLock.lockId, expiresAt: myLock.expiresAt };
+        return {
+          ...baseStatus,
+          status: "selected",
+          lockId: myLock.lockId,
+          lockIds: myLocks.map((l) => l.lockId),
+          expiresAt: myLock.expiresAt,
+        };
       }
 
       // Capacity still available
-      return { slot, status: "available" };
+      return { ...baseStatus, status: "available" };
     });
 
     res.status(200).json({ slotStatuses });

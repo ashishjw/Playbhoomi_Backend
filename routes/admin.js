@@ -1250,7 +1250,7 @@ router.get("/admin/settings", checkAdminAuth, async (_req, res) => {
     res.status(200).json({
       taxRate,
       convenienceFee: settings.convenienceFee ?? 35,
-      discountRate: settings.discountRate ?? 10,
+      discountRate: settings.discountRate ?? 0,
     });
   } catch (err) {
     console.error("Failed to get settings:", err);
